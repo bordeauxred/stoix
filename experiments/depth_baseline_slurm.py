@@ -64,7 +64,7 @@ def build_command(exp: dict) -> list:
     layer_sizes = "[" + ",".join(["256"] * depth) + "]"
 
     cmd = [
-        "uv", "run", "python",
+        "uv", "run", "--frozen", "python",
         "stoix/systems/ddpg/ff_td3.py",
         f"env={exp['env']}",
         f"arch.seed={exp['seed']}",

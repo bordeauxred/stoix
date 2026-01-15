@@ -74,7 +74,7 @@ def run_experiment(depth: int, env: str, seed: int, dry_run: bool = False) -> tu
     env_name = env.split("/")[1]
 
     cmd = [
-        "uv", "run", "python",
+        "uv", "run", "--frozen", "python",
         "stoix/systems/ddpg/ff_td3.py",
         f"env={env}",
         f"arch.seed={seed}",

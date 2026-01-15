@@ -12,6 +12,11 @@
 #SBATCH --error=logs/depth_baseline_%A_%a.err
 #SBATCH -C inet
 
+set -e
+
+# Add uv to PATH (installed via: curl -LsSf https://astral.sh/uv/install.sh | sh)
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
 mkdir -p logs
 
 # Load secrets from .env file
@@ -20,6 +25,7 @@ if [ -f experiments/.env ]; then
 fi
 
 # Run the experiment for this array task
-uv run python experiments/depth_baseline_slurm.py --task-id $SLURM_ARRAY_TASK_ID
+# --frozen prevents uv from modifying the environment (avoids race conditions)
+uv run --frozen python experiments/depth_baseline_slurm.py --task-id $SLURM_ARRAY_TASK_ID
 
 echo "Task $SLURM_ARRAY_TASK_ID completed"
