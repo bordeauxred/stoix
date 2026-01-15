@@ -14,6 +14,11 @@
 
 mkdir -p logs
 
+# Load secrets from .env file
+if [ -f experiments/.env ]; then
+    export $(grep -v '^#' experiments/.env | xargs)
+fi
+
 # Run the experiment for this array task
 uv run python experiments/depth_baseline_slurm.py --task-id $SLURM_ARRAY_TASK_ID
 
