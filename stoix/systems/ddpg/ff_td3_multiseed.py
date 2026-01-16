@@ -52,7 +52,7 @@ from stoix.systems.ddpg.ddpg_types import DDPGOptStates, DDPGParams
 from stoix.systems.q_learning.dqn_types import Transition
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
-from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
+from stoix.utils.jax_utils import unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
@@ -613,7 +613,7 @@ def run_experiment(_config: DictConfig) -> float:
 
     # Run experiment for a total number of evaluations.
     max_episode_return = -jnp.inf
-    best_params = unreplicate_batch_dim(learner_state.params.actor_params.online)
+    best_params_all_seeds = learner_state.params.actor_params.online  # (devices, seeds, ...)
     for eval_step in range(config.arch.num_evaluation):
         # Train.
         start_time = time.time()
@@ -626,57 +626,125 @@ def run_experiment(_config: DictConfig) -> float:
         t = int(steps_per_rollout * (eval_step + 1))
 
         # === PER-SEED LOGGING ===
-        # episode_metrics has shape: (num_updates_per_eval, num_seeds, rollout_length, num_envs)
-        # After get_final_step_metrics it should be: (num_seeds,) or similar
-        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
+        # Raw episode_metrics has shape: (num_updates_per_eval, num_seeds, rollout_length, num_envs)
+        raw_episode_metrics = learner_output.episode_metrics
+
+        # For aggregate logging: get_final_step_metrics uses boolean indexing which
+        # flattens to (num_completed_episodes,) - episodes from all seeds mixed together
+        episode_metrics, ep_completed = get_final_step_metrics(raw_episode_metrics)
 
         # Log aggregate metrics
         episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
         logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
 
         if ep_completed:
-            # Log mean across seeds (backward compatible)
-            mean_metrics = jax.tree_util.tree_map(lambda x: jnp.mean(x), episode_metrics)
-            logger.log(mean_metrics, t, eval_step, LogEvent.ACT)
+            # Collect per-seed episode metrics first
+            seed_episode_returns = []
+            seed_episode_lengths = []
 
-            # Log per-seed metrics if JSON logger is available
             for seed_idx in range(num_seeds):
                 seed_val = seed_values[seed_idx] if seed_idx < len(seed_values) else seed_idx
-                seed_metrics = jax.tree_util.tree_map(
-                    lambda x: float(x[seed_idx]) if x.ndim > 0 and x.shape[0] == num_seeds else float(x),
-                    episode_metrics
+                # Extract just this seed's raw metrics: (num_updates, rollout_length, num_envs)
+                seed_raw_metrics = jax.tree_util.tree_map(
+                    lambda x: x[:, seed_idx, :, :],
+                    raw_episode_metrics
                 )
-                seed_metrics["seed"] = seed_val
-                # Log to JSON with seed suffix
-                t_seed = int(steps_per_seed_per_rollout * (eval_step + 1))
-                logger.log(seed_metrics, t_seed, eval_step, LogEvent.ACT, prefix=f"seed_{seed_val}/")
+                # Get final step metrics for just this seed
+                seed_final_metrics, seed_completed = get_final_step_metrics(seed_raw_metrics)
+                if seed_completed:
+                    # Average all completed episodes for this seed
+                    seed_return = float(jnp.mean(seed_final_metrics["episode_return"]))
+                    seed_length = float(jnp.mean(seed_final_metrics["episode_length"]))
+                    seed_episode_returns.append(seed_return)
+                    seed_episode_lengths.append(seed_length)
 
-        # Training metrics (aggregate)
-        train_metrics = learner_output.train_metrics
+                    # Log per-seed metrics
+                    seed_metrics = {
+                        f"seed_{seed_val}/episode_return": seed_return,
+                        f"seed_{seed_val}/episode_length": seed_length,
+                        f"seed_{seed_val}/steps_per_second": steps_per_seed_per_rollout / elapsed_time,
+                    }
+                    t_seed = int(steps_per_seed_per_rollout * (eval_step + 1))
+                    logger.log(seed_metrics, t_seed, eval_step, LogEvent.ACT)
+
+            # Log aggregate metrics (mean + std across seeds)
+            if seed_episode_returns:
+                aggregate_act_metrics = {
+                    "episode_return": float(jnp.mean(jnp.array(seed_episode_returns))),
+                    "episode_return_std": float(jnp.std(jnp.array(seed_episode_returns))),
+                    "episode_length": float(jnp.mean(jnp.array(seed_episode_lengths))),
+                    "episode_length_std": float(jnp.std(jnp.array(seed_episode_lengths))),
+                    "steps_per_second": steps_per_rollout / elapsed_time,
+                }
+                logger.log(aggregate_act_metrics, t, eval_step, LogEvent.ACT)
+
+        # Training metrics - shape: (num_updates_per_eval, num_seeds) per metric
+        raw_train_metrics = learner_output.train_metrics
         opt_steps_per_eval = config.arch.num_updates_per_eval * config.system.epochs
-        train_metrics["steps_per_second"] = opt_steps_per_eval / elapsed_time
-        logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
+
+        # Log per-seed training metrics
+        for seed_idx in range(num_seeds):
+            seed_val = seed_values[seed_idx] if seed_idx < len(seed_values) else seed_idx
+            seed_train_metrics = {}
+            for k, v in raw_train_metrics.items():
+                if hasattr(v, 'ndim') and v.ndim >= 2:
+                    # Shape: (num_updates, num_seeds, ...) -> average over updates
+                    seed_train_metrics[f"seed_{seed_val}/{k}"] = float(jnp.mean(v[:, seed_idx]))
+                else:
+                    seed_train_metrics[f"seed_{seed_val}/{k}"] = float(jnp.mean(v))
+            logger.log(seed_train_metrics, t, eval_step, LogEvent.TRAIN)
+
+        # Log aggregate training metrics (mean + std across seeds)
+        aggregate_train_metrics = {"steps_per_second": opt_steps_per_eval / elapsed_time}
+        for k, v in raw_train_metrics.items():
+            if hasattr(v, 'ndim') and v.ndim >= 2:
+                # Average over updates first, then compute mean/std over seeds
+                per_seed_means = jnp.mean(v, axis=0)  # (num_seeds,) or (num_seeds, ...)
+                aggregate_train_metrics[k] = float(jnp.mean(per_seed_means))
+                aggregate_train_metrics[f"{k}_std"] = float(jnp.std(per_seed_means))
+            else:
+                aggregate_train_metrics[k] = float(jnp.mean(v))
+        logger.log(aggregate_train_metrics, t, eval_step, LogEvent.TRAIN)
 
         # Prepare for evaluation.
         start_time = time.time()
-        trained_params = unreplicate_batch_dim(
-            learner_output.learner_state.params.actor_params.online
-        )
-        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
-        eval_keys = jnp.stack(eval_keys)
-        eval_keys = eval_keys.reshape(n_devices, -1)
+        all_seed_params = learner_output.learner_state.params.actor_params.online
 
-        # Evaluate (uses first seed's params by default).
-        evaluator_output = evaluator(trained_params, eval_keys)
-        jax.block_until_ready(evaluator_output)
+        # Evaluate each seed's params separately for per-seed metrics
+        seed_eval_returns = []
+        for seed_idx in range(num_seeds):
+            seed_val = seed_values[seed_idx] if seed_idx < len(seed_values) else seed_idx
+            # Extract this seed's params: (devices, ...) - remove seed dim
+            seed_params = jax.tree_util.tree_map(
+                lambda x: x[:, seed_idx, ...],
+                all_seed_params
+            )
+            key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+            eval_keys = jnp.stack(eval_keys)
+            eval_keys = eval_keys.reshape(n_devices, -1)
 
-        # Log the results of the evaluation.
+            evaluator_output = evaluator(seed_params, eval_keys)
+            jax.block_until_ready(evaluator_output)
+
+            seed_return = float(jnp.mean(evaluator_output.episode_metrics["episode_return"]))
+            seed_eval_returns.append(seed_return)
+
+            # Log per-seed evaluation metrics
+            seed_eval_metrics = {
+                f"seed_{seed_val}/episode_return": seed_return,
+                f"seed_{seed_val}/episode_length": float(jnp.mean(evaluator_output.episode_metrics["episode_length"])),
+            }
+            logger.log(seed_eval_metrics, t, eval_step, LogEvent.EVAL)
+
+        # Log aggregate evaluation metrics (mean across seeds)
         elapsed_time = time.time() - start_time
-        episode_return = jnp.mean(evaluator_output.episode_metrics["episode_return"])
-
-        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
-        logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
+        episode_return = float(jnp.mean(jnp.array(seed_eval_returns)))
+        aggregate_eval_metrics = {
+            "episode_return": episode_return,
+            "episode_return_std": float(jnp.std(jnp.array(seed_eval_returns))),
+            "steps_per_second": (num_seeds * config.arch.num_eval_episodes) / elapsed_time,
+        }
+        logger.log(aggregate_eval_metrics, t, eval_step, LogEvent.EVAL)
 
         if save_checkpoint:
             checkpointer.save(
@@ -686,32 +754,57 @@ def run_experiment(_config: DictConfig) -> float:
             )
 
         if config.arch.absolute_metric and max_episode_return <= episode_return:
-            best_params = copy.deepcopy(trained_params)
+            # Store all seeds' params at timestep with best mean performance
+            best_params_all_seeds = copy.deepcopy(all_seed_params)
             max_episode_return = episode_return
 
         # Update runner state to continue training.
         learner_state = learner_output.learner_state
 
-    # Measure absolute metric.
+    # Measure absolute metric for each seed.
     if config.arch.absolute_metric:
         start_time = time.time()
+        t = int(steps_per_rollout * config.arch.num_evaluation)
+        absolute_returns = []
 
-        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
-        eval_keys = jnp.stack(eval_keys)
-        eval_keys = eval_keys.reshape(n_devices, -1)
+        for seed_idx in range(num_seeds):
+            seed_val = seed_values[seed_idx] if seed_idx < len(seed_values) else seed_idx
+            seed_params = jax.tree_util.tree_map(
+                lambda x: x[:, seed_idx, ...],
+                best_params_all_seeds
+            )
+            key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+            eval_keys = jnp.stack(eval_keys)
+            eval_keys = eval_keys.reshape(n_devices, -1)
 
-        evaluator_output = absolute_metric_evaluator(best_params, eval_keys)
-        jax.block_until_ready(evaluator_output)
+            evaluator_output = absolute_metric_evaluator(seed_params, eval_keys)
+            jax.block_until_ready(evaluator_output)
 
+            seed_return = float(jnp.mean(evaluator_output.episode_metrics["episode_return"]))
+            absolute_returns.append(seed_return)
+
+            # Log per-seed absolute metrics
+            seed_abs_metrics = {
+                f"seed_{seed_val}/episode_return": seed_return,
+                f"seed_{seed_val}/episode_length": float(jnp.mean(evaluator_output.episode_metrics["episode_length"])),
+            }
+            logger.log(seed_abs_metrics, t, eval_step, LogEvent.ABSOLUTE)
+
+        # Log aggregate absolute metrics
         elapsed_time = time.time() - start_time
-        t = int(steps_per_rollout * (eval_step + 1))
-        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
-        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
-        logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.ABSOLUTE)
+        aggregate_abs_metrics = {
+            "episode_return": float(jnp.mean(jnp.array(absolute_returns))),
+            "episode_return_std": float(jnp.std(jnp.array(absolute_returns))),
+            "steps_per_second": (num_seeds * config.arch.num_eval_episodes) / elapsed_time,
+        }
+        logger.log(aggregate_abs_metrics, t, eval_step, LogEvent.ABSOLUTE)
+        eval_performance = aggregate_abs_metrics["episode_return"]
+    else:
+        # Use last evaluation's mean return if absolute metric disabled
+        eval_performance = episode_return
 
     # Stop the logger.
     logger.stop()
-    eval_performance = float(jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric]))
     return eval_performance
 
 
