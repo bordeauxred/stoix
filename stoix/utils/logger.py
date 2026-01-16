@@ -323,8 +323,9 @@ class TensorboardLogger(BaseLogger):
 
 
 class JsonLogger(BaseLogger):
-    # These are the only metrics that marl-eval needs to plot.
-    _METRICS_TO_LOG: ClassVar[List[str]] = ["episode_return/mean", "solve_rate", "steps_per_second"]
+    # Metrics to log to JSON. Set to None to log all metrics.
+    # Extended to include per-seed metrics and common training metrics.
+    _METRICS_TO_LOG: ClassVar[List[str] | None] = None  # Log all metrics
 
     def __init__(
         self,
@@ -365,9 +366,8 @@ class JsonLogger(BaseLogger):
         )
 
     def log_stat(self, key: str, value: float, step: int, eval_step: int, event: LogEvent) -> None:
-        # Only write key if it's in the list of metrics to log.
-
-        if key not in self._METRICS_TO_LOG:
+        # Only write key if it's in the list of metrics to log (or log all if None).
+        if self._METRICS_TO_LOG is not None and key not in self._METRICS_TO_LOG:
             return
 
         # The key is in the format <metric_name>/<aggregation_fn> so we need to change it to:
@@ -378,8 +378,9 @@ class JsonLogger(BaseLogger):
         # JsonWriter can't serialize jax arrays
         value = value.item() if isinstance(value, jax.Array) else value
 
-        # We only want to log evaluation metrics to the json logger
-        if event == LogEvent.ABSOLUTE or event == LogEvent.EVAL:
+        # Log evaluation, absolute, and actor (training episode) metrics to JSON
+        # TRAIN events are skipped to avoid bloating JSON with per-update losses
+        if event in (LogEvent.ABSOLUTE, LogEvent.EVAL, LogEvent.ACT):
             self.logger.write(step, key, value, eval_step, event == LogEvent.ABSOLUTE)
 
     def log_config(self, config: Dict) -> None:
@@ -560,9 +561,57 @@ class WandBLogger(BaseLogger):
         self.run.log_artifact(artifact)
 
 
+def _make_run_name(cfg: DictConfig) -> str:
+    """Generate a descriptive run name from config."""
+    from omegaconf import OmegaConf
+
+    parts = []
+
+    # Algorithm name
+    parts.append(cfg.system.system_name)
+
+    # Environment
+    env_name = OmegaConf.select(cfg, "env.scenario.name", default="unknown")
+    parts.append(env_name)
+
+    # Seeds
+    seeds = OmegaConf.select(cfg, "arch.seeds", default=None)
+    if seeds:
+        if len(seeds) > 1:
+            parts.append(f"s{seeds[0]}-{seeds[-1]}")
+        else:
+            parts.append(f"s{seeds[0]}")
+    else:
+        seed = OmegaConf.select(cfg, "arch.seed", default=0)
+        parts.append(f"s{seed}")
+
+    # Activation function
+    activation = OmegaConf.select(cfg, "network.actor_network.pre_torso.activation", default="relu")
+    parts.append(activation)
+
+    # Depth and width from layer_sizes
+    layer_sizes = OmegaConf.select(cfg, "network.actor_network.pre_torso.layer_sizes", default=[256, 256])
+    if layer_sizes:
+        depth = len(layer_sizes)
+        width = layer_sizes[0] if layer_sizes else 256
+        parts.append(f"d{depth}")
+        parts.append(f"w{width}")
+
+    # Ortho regularization (placeholder - add when implemented)
+    # ortho_lambda = OmegaConf.select(cfg, "system.ortho_lambda", default=0)
+    # parts.append(f"ortho{ortho_lambda}" if ortho_lambda > 0 else "no-ortho")
+    parts.append("no-ortho")
+
+    # Timestamp for uniqueness
+    timestamp = datetime.now().strftime("%m%d_%H%M")
+    parts.append(timestamp)
+
+    return "_".join(parts)
+
+
 def _make_multi_logger(cfg: DictConfig) -> MultiLogger:
     """Instantiate only enabled loggers and remove the 'enabled' flag."""
-    unique_token = datetime.now().strftime("%Y%m%d%H%M%S")
+    unique_token = _make_run_name(cfg)
 
     if (
         cfg.logger.loggers.neptune.enabled

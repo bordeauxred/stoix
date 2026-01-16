@@ -629,9 +629,13 @@ def run_experiment(_config: DictConfig) -> float:
         # Raw episode_metrics has shape: (num_updates_per_eval, num_seeds, rollout_length, num_envs)
         raw_episode_metrics = learner_output.episode_metrics
 
+        # IMPORTANT: get_final_step_metrics pops 'is_terminal_step' from the dict,
+        # so we need to make a copy for aggregate logging to preserve the key for per-seed logging
+        raw_episode_metrics_copy = {k: v for k, v in raw_episode_metrics.items()}
+
         # For aggregate logging: get_final_step_metrics uses boolean indexing which
         # flattens to (num_completed_episodes,) - episodes from all seeds mixed together
-        episode_metrics, ep_completed = get_final_step_metrics(raw_episode_metrics)
+        episode_metrics, ep_completed = get_final_step_metrics(raw_episode_metrics_copy)
 
         # Log aggregate metrics
         episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
