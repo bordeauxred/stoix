@@ -55,11 +55,13 @@ run_dqn_depth_study() {
     total=$((${#ENVS[@]} * ${#DEPTHS[@]}))
     current=0
 
+    log_info "Starting $total experiments..."
+
     for env in "${!ENVS[@]}"; do
         IFS=':' read -r env_short steps <<< "${ENVS[$env]}"
 
         for depth in "${!DEPTHS[@]}"; do
-            ((current++))
+            ((++current))
             layers="${DEPTHS[$depth]}"
 
             log_info "[$current/$total] DQN depth=$depth activation=$ACTIVATION on $env_short ($steps steps)"
