@@ -1,0 +1,18 @@
+# --- MLP DQN Networks with GroupSort Activation ---
+#
+# GroupSort is a 1-Lipschitz activation function that preserves gradient norm
+# by sorting features within groups. Combined with Gram orthogonalization,
+# this enables training of very deep networks (100+ layers) with stable
+# gradient flow.
+#
+# References:
+#   - Anil et al., "Sorting out Lipschitz function approximation", ICML 2019
+
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: groupsort  # 1-Lipschitz activation (group_size=2, aka maxmin)
+  action_head:
+    _target_: stoix.networks.heads.DiscreteQNetworkHead
