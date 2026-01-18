@@ -270,3 +270,12 @@ We would like to thank the authors and developers of [Mava][mava] as this was es
 [envpool]: https://github.com/sail-sg/envpool/
 [gymnasium]: https://github.com/Farama-Foundation/Gymnasium
 [cleanba]: https://github.com/vwxyzjn/cleanba
+
+
+## Running on Random Cluster
+
+1.) Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+2.) Get jax to detect gpu
+uv pip install "jax[cuda12_pip]==0.5.3" "jaxlib==0.5.3"
