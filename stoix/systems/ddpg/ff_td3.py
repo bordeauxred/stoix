@@ -674,9 +674,9 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
         env_keys = jax.random.split(env_rng, config.arch.num_envs)
         env_states, timesteps = env.reset(env_keys)
 
-        # Warmup
+        # Warmup: collect trajectory, then add to buffer
         def _warmup_step(carry, _):
-            env_state, timestep, buffer_state, key = carry
+            env_state, timestep, key = carry
             key, policy_key, noise_key = jax.random.split(key, 3)
             action = actor_network.apply(params.actor_params.online, timestep.observation).mode()
             if config.system.exploration_noise != 0:
@@ -692,40 +692,54 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
             transition = Transition(
                 timestep.observation, action, new_timestep.reward, done, next_obs, info
             )
-            new_buffer_state = buffer_fn.add(buffer_state, transition)
 
-            return (new_env_state, new_timestep, new_buffer_state, key), None
+            return (new_env_state, new_timestep, key), transition
 
-        (env_states, timesteps, buffer_state, warmup_rng), _ = jax.lax.scan(
+        (env_states, timesteps, warmup_rng), traj_batch = jax.lax.scan(
             _warmup_step,
-            (env_states, timesteps, buffer_state, warmup_rng),
+            (env_states, timesteps, warmup_rng),
             None,
             config.system.warmup_steps,
         )
+        # Add collected trajectory to buffer
+        buffer_state = buffer_fn.add(buffer_state, traj_batch)
 
-        # Training step
+        # Training step: collect rollout, add to buffer, then do gradient updates
         def _train_step(carry, _):
             params, opt_states, buffer_state, env_state, timestep, key = carry
 
-            # Environment step with exploration
-            key, policy_key, noise_key = jax.random.split(key, 3)
-            action = actor_network.apply(params.actor_params.online, timestep.observation).mode()
-            if config.system.exploration_noise != 0:
-                action = rlax.add_gaussian_noise(
-                    noise_key, action, config.system.exploration_noise * action_scale
-                ).clip(config.system.action_minimum, config.system.action_maximum)
+            # Collect rollout_length transitions
+            def _env_step(env_carry, _):
+                env_state, timestep, key = env_carry
+                key, policy_key, noise_key = jax.random.split(key, 3)
+                action = actor_network.apply(params.actor_params.online, timestep.observation).mode()
+                if config.system.exploration_noise != 0:
+                    action = rlax.add_gaussian_noise(
+                        noise_key, action, config.system.exploration_noise * action_scale
+                    ).clip(config.system.action_minimum, config.system.action_maximum)
 
-            new_env_state, new_timestep = env.step(env_state, action)
-            done = new_timestep.last().reshape(-1)
-            info = new_timestep.extras["episode_metrics"]
-            next_obs = new_timestep.extras["next_obs"]
+                new_env_state, new_timestep = env.step(env_state, action)
+                done = new_timestep.last().reshape(-1)
+                info = new_timestep.extras["episode_metrics"]
+                next_obs = new_timestep.extras["next_obs"]
 
-            transition = Transition(
-                timestep.observation, action, new_timestep.reward, done, next_obs, info
+                transition = Transition(
+                    timestep.observation, action, new_timestep.reward, done, next_obs, info
+                )
+                return (new_env_state, new_timestep, key), transition
+
+            key, rollout_key = jax.random.split(key)
+            (new_env_state, new_timestep, _), traj_batch = jax.lax.scan(
+                _env_step,
+                (env_state, timestep, rollout_key),
+                None,
+                config.system.rollout_length,
             )
-            new_buffer_state = buffer_fn.add(buffer_state, transition)
 
-            # Gradient updates (multiple epochs per env step)
+            # Add collected trajectory to buffer
+            new_buffer_state = buffer_fn.add(buffer_state, traj_batch)
+
+            # Gradient updates (multiple epochs per rollout)
             def _update_epoch(update_carry, _):
                 params, opt_states, key = update_carry
                 key, sample_key, noise_key = jax.random.split(key, 3)
@@ -804,10 +818,11 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                 config.system.epochs,
             )
 
+            # Collect metrics from trajectory batch
             metrics = {
-                "episode_return": info["episode_return"],
-                "episode_length": info["episode_length"],
-                "is_terminal": info["is_terminal_step"],
+                "episode_return": traj_batch.info["episode_return"],
+                "episode_length": traj_batch.info["episode_length"],
+                "is_terminal": traj_batch.info["is_terminal_step"],
                 "q_loss": jnp.mean(loss_infos["q_loss"]),
                 "actor_loss": jnp.mean(loss_infos["actor_loss"]),
             }
@@ -1089,15 +1104,36 @@ def hydra_entry_point(cfg: DictConfig) -> float:
         seeds = list(multiseed)
         print(f"{Fore.CYAN}{Style.BRIGHT}Multi-seed mode: {seeds}{Style.RESET_ALL}")
 
-        # Setup logger for multi-seed
-        logger = StoixLogger(cfg)
-        logger.log_config(OmegaConf.to_container(cfg, resolve=True))
+        # Run multi-seed training (no logging during training)
+        all_params, all_metrics = run_multiseed_experiment(cfg, seeds, logger=None)
 
-        # Run multi-seed training
-        all_params, all_metrics = run_multiseed_experiment(cfg, seeds, logger)
+        # Extract config info for naming
+        env_name = OmegaConf.select(cfg, "env.scenario.task_name", default="unknown")
+        layer_sizes = OmegaConf.select(cfg, "network.actor_network.pre_torso.layer_sizes", default=[256, 256])
+        depth = len(layer_sizes) if layer_sizes else 2
+        activation = OmegaConf.select(cfg, "network.actor_network.pre_torso.activation", default="silu")
+        utd = OmegaConf.select(cfg, "system.epochs", default=1)
 
-        # Stop logger
-        logger.stop()
+        # Create group name (shared by all seeds)
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        group_name = f"td3_{env_name}_d{depth}_{activation}_utd{utd}_{timestamp}"
+
+        # Log to WandB (separate run per seed) and JSON
+        if cfg.logger.loggers.wandb.enabled:
+            from stoix.utils.logger import log_multiseed_wandb
+            steps_per_log = cfg.system.rollout_length * cfg.arch.total_num_envs
+            log_multiseed_wandb(
+                all_metrics=all_metrics,
+                seeds=seeds,
+                config=cfg,
+                group_name=group_name,
+                env_name=env_name,
+                depth=depth,
+                activation=activation,
+                utd=utd,
+                steps_per_log=steps_per_log,
+            )
 
         # Return mean performance across seeds
         final_returns = []

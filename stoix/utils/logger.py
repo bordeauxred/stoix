@@ -468,13 +468,14 @@ class WandBLogger(BaseLogger):
         *,
         entity: str | None = None,
         notes: str | None = None,
+        name: str | None = None,
     ) -> None:
         """
         Initialize W&B logger for experiment tracking.
 
         Args:
             base_exp_path: Base path where all logs are stored.
-            unique_token: Unique identifier string for this run (used as run.name).
+            unique_token: Unique identifier string for this run (used as run.name if name not provided).
             system_name: Name of the system/algorithm being logged.
             project: W&B project name.
             tag: List of tags to attach to the run.
@@ -485,9 +486,13 @@ class WandBLogger(BaseLogger):
             run_id: W&B run ID to resume. If provided, resume="allow" is used.
             entity: Optional W&B entity/org.
             notes: Optional run notes.
+            name: Optional custom run name. If not provided, uses unique_token.
         """
         # Map Stoix "group_tag" (list) to W&B's single 'group' string.
         group = "_".join(group_tag) if group_tag else None
+
+        # Use custom name if provided, otherwise fall back to unique_token
+        run_name = name if name is not None else unique_token
 
         # Prefer stable run naming using your unique token.
         init_kwargs: Dict = {
@@ -495,12 +500,12 @@ class WandBLogger(BaseLogger):
             "entity": entity,
             "tags": list(tag),
             "group": group,
-            "name": unique_token,
+            "name": run_name,
             "notes": notes,
             "reinit": True,
         }
         if run_id is not None:
-            # Don’t override existing run’s name
+            # Don't override existing run's name
             init_kwargs.pop("name", None)
             init_kwargs.update(id=run_id, resume="allow")
 
@@ -523,7 +528,10 @@ class WandBLogger(BaseLogger):
         # or it's a single metric that doesn't contain a '/'.
         is_main_metric = "/" not in key or key.endswith("/mean")
 
-        if not self.detailed_logging and not is_main_metric:
+        # Always log seed-specific metrics (e.g., seed_42/episode_return)
+        is_seed_metric = key.startswith("seed_")
+
+        if not self.detailed_logging and not is_main_metric and not is_seed_metric:
             return
 
         # Convert JAX/NumPy scalars
@@ -574,16 +582,9 @@ def _make_run_name(cfg: DictConfig) -> str:
     env_name = OmegaConf.select(cfg, "env.scenario.name", default="unknown")
     parts.append(env_name)
 
-    # Seeds
-    seeds = OmegaConf.select(cfg, "arch.seeds", default=None)
-    if seeds:
-        if len(seeds) > 1:
-            parts.append(f"s{seeds[0]}-{seeds[-1]}")
-        else:
-            parts.append(f"s{seeds[0]}")
-    else:
-        seed = OmegaConf.select(cfg, "arch.seed", default=0)
-        parts.append(f"s{seed}")
+    # Base seed (for vmap runs, this is the RNG seed - individual seeds logged separately)
+    seed = OmegaConf.select(cfg, "arch.seed", default=0)
+    parts.append(f"s{seed}")
 
     # Activation function
     activation = OmegaConf.select(cfg, "network.actor_network.pre_torso.activation", default="relu")
@@ -660,3 +661,115 @@ def describe(x: ArrayLike) -> Union[Dict[str, ArrayLike], ArrayLike]:
 
     # np instead of jnp because we don't jit here
     return {"mean": np.mean(x), "std": np.std(x), "min": np.min(x), "max": np.max(x)}
+
+
+def save_metrics_to_json(metrics: dict, path: str) -> None:
+    """Save per-seed metrics to JSON for offline analysis.
+
+    Args:
+        metrics: Dictionary of metrics (can contain JAX arrays).
+        path: Path to save the JSON file.
+    """
+    import json
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Convert JAX/numpy arrays to lists for JSON serialization
+    def to_serializable(x):
+        if hasattr(x, 'tolist'):
+            return x.tolist()
+        return x
+
+    serializable = jax.tree.map(to_serializable, metrics)
+
+    with open(path, 'w') as f:
+        json.dump(serializable, f, indent=2)
+
+
+def log_multiseed_wandb(
+    all_metrics: dict,
+    seeds: list,
+    config: DictConfig,
+    group_name: str,
+    env_name: str,
+    depth: int,
+    activation: str,
+    utd: int,
+    steps_per_log: int = 1,
+) -> None:
+    """Log multi-seed experiment results to WandB with separate runs per seed.
+
+    Creates one WandB run per seed, all sharing the same group for aggregation.
+
+    Args:
+        all_metrics: Dictionary of metrics with shape (num_seeds, num_steps, ...).
+        seeds: List of seed values.
+        config: Hydra config with WandB settings.
+        group_name: Shared group name for all seeds.
+        env_name: Environment name for tags.
+        depth: Network depth for tags.
+        activation: Activation function for tags.
+        utd: Update-to-data ratio for tags.
+        steps_per_log: Number of environment steps between log points.
+    """
+    project = config.logger.loggers.wandb.project
+    base_tags = list(config.logger.loggers.wandb.tag) if config.logger.loggers.wandb.tag else []
+
+    for i, seed in enumerate(seeds):
+        run_name = f"{group_name}_s{seed}"
+
+        # Extract this seed's metrics
+        seed_metrics = jax.tree.map(lambda x: x[i] if x.ndim > 0 else x, all_metrics)
+
+        # Initialize WandB run for this seed
+        run = wandb.init(
+            project=project,
+            name=run_name,
+            group=group_name,
+            tags=base_tags + [f"s{seed}", f"d{depth}", activation, f"utd{utd}", env_name],
+            reinit=True,
+        )
+
+        # Log config
+        wandb.config.update(OmegaConf.to_container(config, resolve=True), allow_val_change=True)
+
+        # Log metrics over time
+        # episode_return shape: (num_updates, rollout_length, num_envs) - only valid at terminal steps
+        # q_loss, actor_loss shape: (num_updates,) - already aggregated per update
+        # is_terminal shape: (num_updates, rollout_length, num_envs) - mask for valid episode returns
+
+        returns = np.asarray(seed_metrics.get("episode_return", []))
+        is_terminal = np.asarray(seed_metrics.get("is_terminal", []))
+        q_loss = np.asarray(seed_metrics.get("q_loss", []))
+        actor_loss = np.asarray(seed_metrics.get("actor_loss", []))
+
+        num_updates = len(q_loss) if len(q_loss) > 0 else len(returns)
+
+        for step_idx in range(num_updates):
+            log_dict = {}
+
+            # Episode return: only count terminal steps
+            if len(returns) > step_idx and len(is_terminal) > step_idx:
+                step_returns = returns[step_idx]  # (rollout_length, num_envs)
+                step_terminal = is_terminal[step_idx]  # (rollout_length, num_envs)
+
+                if np.any(step_terminal):
+                    # Mean of returns at terminal steps only
+                    terminal_returns = step_returns[step_terminal]
+                    log_dict["episode_return"] = float(np.mean(terminal_returns))
+
+            # Losses are already scalars per update
+            if len(q_loss) > step_idx:
+                log_dict["q_loss"] = float(q_loss[step_idx])
+            if len(actor_loss) > step_idx:
+                log_dict["actor_loss"] = float(actor_loss[step_idx])
+
+            if log_dict:
+                wandb.log(log_dict, step=step_idx * steps_per_log)
+
+        wandb.finish()
+
+        # Also save to JSON
+        json_path = f"results/json/{group_name}/seed_{seed}/metrics.json"
+        save_metrics_to_json(seed_metrics, json_path)
+        print(f"Saved metrics for seed {seed} to {json_path}")
