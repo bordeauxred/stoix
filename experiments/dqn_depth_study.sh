@@ -93,6 +93,9 @@ COMMON="arch.total_num_envs=$NUM_ENVS"
 # Network architecture override
 NETWORK="network.actor_network.pre_torso.layer_sizes=$LAYERS"
 
+# Note: Run naming is handled automatically by the code
+# Each seed gets its own WandB run with shared group for aggregation
+# JSON logs are saved automatically to results/json/{group}/seed_{seed}/metrics.json
 uv run python $SYSTEM \
     env=$ENV \
     arch.seed=42 \
@@ -102,10 +105,7 @@ uv run python $SYSTEM \
     $NETWORK \
     logger.loggers.wandb.enabled=True \
     logger.loggers.wandb.project=stoix_dqn_depth_study \
-    logger.loggers.wandb.name=$RUN_NAME \
-    logger.loggers.wandb.tags="[depth_study,baseline,depth_$DEPTH,$ENV_SHORT]" \
-    logger.loggers.json.enabled=True \
-    logger.loggers.json.path=dqn_depth_study/${ENV_SHORT}/depth_${DEPTH}
+    "logger.loggers.wandb.tag=[depth_study,baseline]"
 
 echo "============================================================"
 echo "Task $TASK_ID completed: depth=$DEPTH on $ENV_SHORT"
