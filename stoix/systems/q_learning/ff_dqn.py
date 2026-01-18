@@ -558,12 +558,13 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
         log_every_steps = 100_000  # Log every 100k environment steps
         log_interval = max(1, log_every_steps // steps_per_update)
 
-        def _progress_callback(step, q_loss, num_updates, steps_per_update):
+        def _progress_callback(step, q_loss, episode_return, num_updates, steps_per_update):
             """Print progress during training."""
             current_steps = (step + 1) * steps_per_update
             total = num_updates * steps_per_update
             pct = 100.0 * current_steps / total
-            print(f"\r[Step {current_steps:,}/{total:,}] q_loss: {q_loss:.4f} | {pct:.1f}%", end="", flush=True)
+            ret_str = f"return: {episode_return:.1f}" if episode_return is not None else "return: --"
+            print(f"\r[Step {current_steps:,}/{total:,}] {ret_str} | q_loss: {q_loss:.4f} | {pct:.1f}%", end="", flush=True)
 
         # Training step: collect rollout, add to buffer, then do gradient updates
         def _train_step(carry, step_idx):
@@ -653,15 +654,28 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                 "q_loss": q_loss_mean,
             }
 
+            # Compute episode return (mean over terminal steps)
+            is_terminal = traj_batch.info["is_terminal_step"]
+            episode_returns = traj_batch.info["episode_return"]
+            # Mean return where episodes ended, or nan if none
+            mean_return = jnp.where(
+                jnp.any(is_terminal),
+                jnp.sum(jnp.where(is_terminal, episode_returns, 0.0)) / jnp.maximum(jnp.sum(is_terminal), 1),
+                jnp.nan,
+            )
+
             # Progress logging (only at intervals to avoid slowdown)
-            def _log_progress(step, q_loss):
+            def _log_progress(step, q_loss, ep_return):
+                import math
                 # step/q_loss may be batched when vmapped over seeds
                 step_val = int(step.flatten()[0]) if hasattr(step, 'flatten') else int(step)
                 q_loss_val = float(q_loss.mean()) if hasattr(q_loss, 'mean') else float(q_loss)
+                ep_return_val = float(ep_return.mean()) if hasattr(ep_return, 'mean') else float(ep_return)
+                ep_return_val = None if math.isnan(ep_return_val) else ep_return_val
                 if step_val % log_interval == 0:
-                    _progress_callback(step_val, q_loss_val, num_updates, steps_per_update)
+                    _progress_callback(step_val, q_loss_val, ep_return_val, num_updates, steps_per_update)
 
-            jax.debug.callback(_log_progress, step_idx, q_loss_mean)
+            jax.debug.callback(_log_progress, step_idx, q_loss_mean, mean_return)
 
             return (new_params, new_opt_state, new_buffer_state, new_env_state, new_timestep, key), metrics
 
