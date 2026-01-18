@@ -532,8 +532,397 @@ def learner_setup(
     return learn, actor_network, init_learner_state
 
 
+# =============================================================================
+# PureJaxRL-Style Multi-Seed Training (Option 3)
+#
+# The make_train function returns a pure train(rng) function that can be vmapped
+# for multi-seed training. This follows the PureJaxRL design pattern.
+#
+# Single seed:  result = jax.jit(train_fn)(jax.random.PRNGKey(42))
+# Multi-seed:   results = jax.vmap(train_fn)(rngs)
+# =============================================================================
+
+
+def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams, dict]]:
+    """Create a pure training function that can be vmapped over seeds.
+
+    This follows the PureJaxRL design pattern where train(rng) is a pure function
+    that initializes everything from the RNG and returns final params + metrics.
+
+    Args:
+        config: Hydra config (will be deep-copied internally)
+
+    Returns:
+        train_fn: A function with signature train(rng) -> (params, metrics)
+                  that can be vmapped for multi-seed training.
+
+    Usage:
+        # Single seed
+        train_fn = make_train(config)
+        params, metrics = jax.jit(train_fn)(jax.random.PRNGKey(42))
+
+        # Multi-seed (just vmap!)
+        seeds = jnp.array([42, 43, 44, 45, 46])
+        rngs = jax.vmap(jax.random.PRNGKey)(seeds)
+        all_params, all_metrics = jax.vmap(train_fn)(rngs)
+    """
+    config = copy.deepcopy(config)
+
+    # Calculate total timesteps and validate config
+    config.num_devices = 1  # Pure function runs on single device
+    config.arch.update_batch_size = 1  # Single batch for pure function
+    config = check_total_timesteps(config)
+
+    # Create environment
+    env, _ = environments.make(config=config)
+    action_dim = int(env.action_space().shape[-1])
+    config.system.action_dim = action_dim
+    config.system.action_minimum = float(env.action_space().minimum)
+    config.system.action_maximum = float(env.action_space().maximum)
+
+    # Create actor network
+    actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
+    actor_action_head = hydra.utils.instantiate(
+        config.network.actor_network.action_head, action_dim=action_dim
+    )
+    action_head_post_processor = hydra.utils.instantiate(
+        config.network.actor_network.post_processor,
+        minimum=config.system.action_minimum,
+        maximum=config.system.action_maximum,
+        scale_fn=tanh_to_spec,
+    )
+    actor_action_head = CompositeNetwork([actor_action_head, action_head_post_processor])
+    actor_network = Actor(torso=actor_torso, action_head=actor_action_head)
+
+    # Create double Q-network
+    def create_q_network(cfg: DictConfig) -> CompositeNetwork:
+        q_network_input = hydra.utils.instantiate(cfg.network.q_network.input_layer)
+        q_network_torso = hydra.utils.instantiate(cfg.network.q_network.pre_torso)
+        q_network_head = hydra.utils.instantiate(cfg.network.q_network.critic_head)
+        return CompositeNetwork([q_network_input, q_network_torso, q_network_head])
+
+    double_q_network = MultiNetwork([create_q_network(config), create_q_network(config)])
+
+    # Create optimizers
+    actor_lr = make_learning_rate(config.system.actor_lr, config, config.system.epochs)
+    q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
+
+    def delayed_policy_update(step_count: int) -> bool:
+        return jnp.mod(step_count, config.system.policy_frequency) == 0
+
+    actor_optim = optax.conditionally_mask(
+        optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            optax.adam(actor_lr, eps=1e-5),
+        ),
+        should_transform_fn=delayed_policy_update,
+    )
+    q_optim = optax.chain(
+        optax.clip_by_global_norm(config.system.max_grad_norm),
+        optax.adam(q_lr, eps=1e-5),
+    )
+
+    # Create buffer template
+    init_x = env.observation_space().generate_value()
+    init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
+    init_a = jnp.zeros((1, action_dim))
+    dummy_transition = Transition(
+        obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        action=jnp.zeros((action_dim,), dtype=float),
+        reward=jnp.zeros((), dtype=float),
+        done=jnp.zeros((), dtype=bool),
+        next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
+    )
+
+    config.system.buffer_size = config.system.total_buffer_size
+    config.system.batch_size = config.system.total_batch_size
+    buffer_fn = fbx.make_item_buffer(
+        max_length=config.system.buffer_size,
+        min_length=config.system.batch_size,
+        sample_batch_size=config.system.batch_size,
+        add_batches=True,
+        add_sequences=True,
+    )
+
+    # Exploration policy
+    action_scale = (config.system.action_maximum - config.system.action_minimum) / 2
+
+    def train(rng: chex.PRNGKey) -> Tuple[DDPGParams, dict]:
+        """Pure training function - vmappable over seeds."""
+        # Split RNG
+        rng, actor_rng, q_rng, env_rng, warmup_rng, train_rng = jax.random.split(rng, 6)
+
+        # Initialize params
+        actor_online_params = actor_network.init(actor_rng, init_x)
+        actor_target_params = actor_online_params
+        actor_opt_state = actor_optim.init(actor_online_params)
+        actor_params = OnlineAndTarget(actor_online_params, actor_target_params)
+
+        q_online_params = double_q_network.init(q_rng, init_x, init_a)
+        q_target_params = q_online_params
+        q_opt_state = q_optim.init(q_online_params)
+        q_params = OnlineAndTarget(q_online_params, q_target_params)
+
+        params = DDPGParams(actor_params, q_params)
+        opt_states = DDPGOptStates(actor_opt_state, q_opt_state)
+
+        # Initialize buffer
+        buffer_state = buffer_fn.init(dummy_transition)
+
+        # Initialize environment
+        env_keys = jax.random.split(env_rng, config.arch.num_envs)
+        env_states, timesteps = env.reset(env_keys)
+
+        # Warmup
+        def _warmup_step(carry, _):
+            env_state, timestep, buffer_state, key = carry
+            key, policy_key, noise_key = jax.random.split(key, 3)
+            action = actor_network.apply(params.actor_params.online, timestep.observation).mode()
+            if config.system.exploration_noise != 0:
+                action = rlax.add_gaussian_noise(
+                    noise_key, action, config.system.exploration_noise * action_scale
+                ).clip(config.system.action_minimum, config.system.action_maximum)
+
+            new_env_state, new_timestep = env.step(env_state, action)
+            done = new_timestep.last().reshape(-1)
+            info = new_timestep.extras["episode_metrics"]
+            next_obs = new_timestep.extras["next_obs"]
+
+            transition = Transition(
+                timestep.observation, action, new_timestep.reward, done, next_obs, info
+            )
+            new_buffer_state = buffer_fn.add(buffer_state, transition)
+
+            return (new_env_state, new_timestep, new_buffer_state, key), None
+
+        (env_states, timesteps, buffer_state, warmup_rng), _ = jax.lax.scan(
+            _warmup_step,
+            (env_states, timesteps, buffer_state, warmup_rng),
+            None,
+            config.system.warmup_steps,
+        )
+
+        # Training step
+        def _train_step(carry, _):
+            params, opt_states, buffer_state, env_state, timestep, key = carry
+
+            # Environment step with exploration
+            key, policy_key, noise_key = jax.random.split(key, 3)
+            action = actor_network.apply(params.actor_params.online, timestep.observation).mode()
+            if config.system.exploration_noise != 0:
+                action = rlax.add_gaussian_noise(
+                    noise_key, action, config.system.exploration_noise * action_scale
+                ).clip(config.system.action_minimum, config.system.action_maximum)
+
+            new_env_state, new_timestep = env.step(env_state, action)
+            done = new_timestep.last().reshape(-1)
+            info = new_timestep.extras["episode_metrics"]
+            next_obs = new_timestep.extras["next_obs"]
+
+            transition = Transition(
+                timestep.observation, action, new_timestep.reward, done, next_obs, info
+            )
+            new_buffer_state = buffer_fn.add(buffer_state, transition)
+
+            # Gradient updates (multiple epochs per env step)
+            def _update_epoch(update_carry, _):
+                params, opt_states, key = update_carry
+                key, sample_key, noise_key = jax.random.split(key, 3)
+
+                # Sample from buffer
+                sample = buffer_fn.sample(new_buffer_state, sample_key)
+                transitions = sample.experience
+
+                # Q-loss
+                def _q_loss_fn(q_params, target_q_params, target_actor_params, transitions, rng_key):
+                    q_tm1 = double_q_network.apply(q_params, transitions.obs, transitions.action)
+                    noise = jax.random.normal(rng_key, transitions.action.shape) * config.system.policy_noise
+                    clipped_noise = jnp.clip(noise, -config.system.noise_clip, config.system.noise_clip) * action_scale
+                    next_action = actor_network.apply(target_actor_params, transitions.next_obs).mode() + clipped_noise
+                    next_action = jnp.clip(next_action, config.system.action_minimum, config.system.action_maximum)
+                    q_t = double_q_network.apply(target_q_params, transitions.next_obs, next_action)
+                    next_v = jnp.min(q_t, axis=-1)
+
+                    discount = 1.0 - transitions.done.astype(jnp.float32)
+                    d_t = (discount * config.system.gamma).astype(jnp.float32)
+                    r_t = jnp.clip(transitions.reward, -config.system.max_abs_reward, config.system.max_abs_reward).astype(jnp.float32)
+
+                    target_q = jax.lax.stop_gradient(r_t + d_t * next_v)
+                    q_error = q_tm1 - jnp.expand_dims(target_q, -1)
+                    q_loss = 0.5 * jnp.mean(jnp.square(q_error))
+                    return q_loss, {"q_loss": q_loss}
+
+                # Actor loss
+                def _actor_loss_fn(actor_params, q_params, transitions):
+                    a_t = actor_network.apply(actor_params, transitions.obs).mode()
+                    a_t = a_t.clip(config.system.action_minimum, config.system.action_maximum)
+                    q_value = double_q_network.apply(q_params, transitions.obs, a_t)
+                    return -jnp.mean(q_value), {"actor_loss": -jnp.mean(q_value)}
+
+                # Compute gradients
+                q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
+                q_grads, q_loss_info = q_grad_fn(
+                    params.q_params.online, params.q_params.target,
+                    params.actor_params.target, transitions, noise_key
+                )
+
+                actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
+                actor_grads, actor_loss_info = actor_grad_fn(
+                    params.actor_params.online, params.q_params.online, transitions
+                )
+
+                # Update Q
+                q_updates, new_q_opt_state = q_optim.update(q_grads, opt_states.q_opt_state)
+                new_q_online = optax.apply_updates(params.q_params.online, q_updates)
+
+                # Update actor
+                actor_updates, new_actor_opt_state = actor_optim.update(actor_grads, opt_states.actor_opt_state)
+                new_actor_online = optax.apply_updates(params.actor_params.online, actor_updates)
+
+                # Target update
+                new_actor_target, new_q_target = optax.incremental_update(
+                    (new_actor_online, new_q_online),
+                    (params.actor_params.target, params.q_params.target),
+                    config.system.tau,
+                )
+
+                new_params = DDPGParams(
+                    OnlineAndTarget(new_actor_online, new_actor_target),
+                    OnlineAndTarget(new_q_online, new_q_target),
+                )
+                new_opt_states = DDPGOptStates(new_actor_opt_state, new_q_opt_state)
+
+                loss_info = {**actor_loss_info, **q_loss_info}
+                return (new_params, new_opt_states, key), loss_info
+
+            key, epoch_key = jax.random.split(key)
+            (new_params, new_opt_states, _), loss_infos = jax.lax.scan(
+                _update_epoch,
+                (params, opt_states, epoch_key),
+                None,
+                config.system.epochs,
+            )
+
+            metrics = {
+                "episode_return": info["episode_return"],
+                "episode_length": info["episode_length"],
+                "is_terminal": info["is_terminal_step"],
+                "q_loss": jnp.mean(loss_infos["q_loss"]),
+                "actor_loss": jnp.mean(loss_infos["actor_loss"]),
+            }
+
+            return (new_params, new_opt_states, new_buffer_state, new_env_state, new_timestep, key), metrics
+
+        # Run training
+        num_updates = config.arch.num_updates
+        init_carry = (params, opt_states, buffer_state, env_states, timesteps, train_rng)
+        (final_params, _, _, _, _, _), all_metrics = jax.lax.scan(
+            _train_step, init_carry, None, num_updates
+        )
+
+        return final_params, all_metrics
+
+    return train
+
+
+def run_multiseed_experiment(
+    config: DictConfig,
+    seeds: list,
+    logger: StoixLogger = None,
+) -> Tuple[DDPGParams, dict]:
+    """Run multi-seed TD3 training using vmap over seeds.
+
+    This is the PureJaxRL-style approach where we vmap over the pure train function.
+
+    Args:
+        config: Hydra config
+        seeds: List of seed values to train with
+        logger: Optional StoixLogger for logging
+
+    Returns:
+        all_params: Params for each seed (shape: [num_seeds, ...])
+        all_metrics: Metrics for each seed (shape: [num_seeds, num_steps, ...])
+    """
+    num_seeds = len(seeds)
+    print(f"{Fore.CYAN}{Style.BRIGHT}Running {num_seeds} seeds in parallel: {seeds}{Style.RESET_ALL}")
+
+    # Create the training function
+    train_fn = make_train(config)
+
+    # Create RNGs for each seed
+    seed_array = jnp.array(seeds)
+    rngs = jax.vmap(jax.random.PRNGKey)(seed_array)
+
+    # Vmap and JIT the training function
+    vmapped_train = jax.jit(jax.vmap(train_fn))
+
+    # Run training
+    start_time = time.time()
+    print(f"{Fore.YELLOW}{Style.BRIGHT}Starting JIT compilation...{Style.RESET_ALL}")
+
+    all_params, all_metrics = vmapped_train(rngs)
+    jax.block_until_ready(all_params)
+
+    elapsed_time = time.time() - start_time
+    print(f"{Fore.GREEN}{Style.BRIGHT}Training completed in {elapsed_time:.1f}s{Style.RESET_ALL}")
+
+    # Log results if logger provided
+    if logger is not None:
+        # Log per-seed final metrics
+        for i, seed in enumerate(seeds):
+            is_terminal = all_metrics["is_terminal"][i]
+            if jnp.any(is_terminal):
+                terminal_returns = jnp.where(
+                    is_terminal,
+                    all_metrics["episode_return"][i],
+                    jnp.nan,
+                )
+                final_return = jnp.nanmean(terminal_returns)
+            else:
+                final_return = all_metrics["episode_return"][i, -1]
+
+            logger.log(
+                {
+                    f"seed_{seed}/episode_return": float(final_return),
+                    f"seed_{seed}/q_loss": float(jnp.mean(all_metrics["q_loss"][i])),
+                    f"seed_{seed}/actor_loss": float(jnp.mean(all_metrics["actor_loss"][i])),
+                },
+                int(config.arch.total_timesteps),
+                0,
+                LogEvent.EVAL,
+            )
+
+        # Log aggregate metrics
+        final_returns = []
+        for i in range(num_seeds):
+            is_terminal = all_metrics["is_terminal"][i]
+            if jnp.any(is_terminal):
+                terminal_returns = jnp.where(
+                    is_terminal,
+                    all_metrics["episode_return"][i],
+                    jnp.nan,
+                )
+                final_returns.append(float(jnp.nanmean(terminal_returns)))
+            else:
+                final_returns.append(float(all_metrics["episode_return"][i, -1]))
+
+        final_returns = jnp.array(final_returns)
+        logger.log(
+            {
+                "episode_return": float(jnp.mean(final_returns)),
+                "episode_return_std": float(jnp.std(final_returns)),
+            },
+            int(config.arch.total_timesteps),
+            0,
+            LogEvent.EVAL,
+        )
+
+    return all_params, all_metrics
+
+
 def run_experiment(_config: DictConfig) -> float:
-    """Runs experiment."""
+    """Runs experiment (original single-seed with intermediate evaluation)."""
     config = copy.deepcopy(_config)
 
     # Calculate total timesteps.
@@ -684,14 +1073,54 @@ def run_experiment(_config: DictConfig) -> float:
     version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
-    """Experiment entry point."""
+    """Experiment entry point.
+
+    Supports multi-seed training via +multiseed=[42,43,44,45,46] argument.
+    When multiseed is provided, uses PureJaxRL-style vmap over seeds.
+    """
     # Allow dynamic attributes.
     OmegaConf.set_struct(cfg, False)
 
-    # Run experiment.
-    eval_performance = run_experiment(cfg)
+    # Check for multi-seed mode
+    multiseed = OmegaConf.select(cfg, "multiseed", default=None)
 
-    print(f"{Fore.CYAN}{Style.BRIGHT}TD3 experiment completed{Style.RESET_ALL}")
+    if multiseed is not None:
+        # Multi-seed mode: use PureJaxRL-style vmapped training
+        seeds = list(multiseed)
+        print(f"{Fore.CYAN}{Style.BRIGHT}Multi-seed mode: {seeds}{Style.RESET_ALL}")
+
+        # Setup logger for multi-seed
+        logger = StoixLogger(cfg)
+        logger.log_config(OmegaConf.to_container(cfg, resolve=True))
+
+        # Run multi-seed training
+        all_params, all_metrics = run_multiseed_experiment(cfg, seeds, logger)
+
+        # Stop logger
+        logger.stop()
+
+        # Return mean performance across seeds
+        final_returns = []
+        for i in range(len(seeds)):
+            is_terminal = all_metrics["is_terminal"][i]
+            if jnp.any(is_terminal):
+                terminal_returns = jnp.where(
+                    is_terminal,
+                    all_metrics["episode_return"][i],
+                    jnp.nan,
+                )
+                final_returns.append(float(jnp.nanmean(terminal_returns)))
+            else:
+                final_returns.append(float(all_metrics["episode_return"][i, -1]))
+
+        eval_performance = float(jnp.mean(jnp.array(final_returns)))
+        print(f"{Fore.CYAN}{Style.BRIGHT}TD3 multi-seed experiment completed{Style.RESET_ALL}")
+        print(f"Mean return: {eval_performance:.2f} ± {float(jnp.std(jnp.array(final_returns))):.2f}")
+    else:
+        # Single-seed mode: use original implementation
+        eval_performance = run_experiment(cfg)
+        print(f"{Fore.CYAN}{Style.BRIGHT}TD3 experiment completed{Style.RESET_ALL}")
+
     return eval_performance
 
 

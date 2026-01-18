@@ -414,8 +414,329 @@ def learner_setup(
     return learn, eval_q_network, init_learner_state
 
 
+# =============================================================================
+# PureJaxRL-Style Multi-Seed Training (Option 3)
+#
+# The make_train function returns a pure train(rng) function that can be vmapped
+# for multi-seed training. This follows the PureJaxRL design pattern.
+#
+# Single seed:  result = jax.jit(train_fn)(jax.random.PRNGKey(42))
+# Multi-seed:   results = jax.vmap(train_fn)(rngs)
+# =============================================================================
+
+
+def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTarget, dict]]:
+    """Create a pure training function that can be vmapped over seeds.
+
+    This follows the PureJaxRL design pattern where train(rng) is a pure function
+    that initializes everything from the RNG and returns final params + metrics.
+
+    Args:
+        config: Hydra config (will be deep-copied internally)
+
+    Returns:
+        train_fn: A function with signature train(rng) -> (params, metrics)
+                  that can be vmapped for multi-seed training.
+
+    Usage:
+        # Single seed
+        train_fn = make_train(config)
+        params, metrics = jax.jit(train_fn)(jax.random.PRNGKey(42))
+
+        # Multi-seed (just vmap!)
+        seeds = jnp.array([42, 43, 44, 45, 46])
+        rngs = jax.vmap(jax.random.PRNGKey)(seeds)
+        all_params, all_metrics = jax.vmap(train_fn)(rngs)
+    """
+    config = copy.deepcopy(config)
+
+    # Calculate total timesteps and validate config
+    config.num_devices = 1  # Pure function runs on single device
+    config.arch.update_batch_size = 1  # Single batch for pure function
+    config = check_total_timesteps(config)
+
+    # Create environment (can be created once, reused across seeds)
+    env, _ = environments.make(config=config)
+    action_dim = int(env.action_space().num_values)
+    config.system.action_dim = action_dim
+
+    # Create network architecture (shared structure, different params per seed)
+    q_network_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
+    q_network_action_head = hydra.utils.instantiate(
+        config.network.actor_network.action_head,
+        action_dim=action_dim,
+        epsilon=config.system.training_epsilon,
+    )
+    q_network = Actor(torso=q_network_torso, action_head=q_network_action_head)
+
+    # Create optimizer
+    q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
+    q_optim = optax.chain(
+        optax.clip_by_global_norm(config.system.max_grad_norm),
+        optax.adam(q_lr, eps=1e-5),
+    )
+
+    # Create buffer template
+    init_x = env.observation_space().generate_value()
+    init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
+    dummy_transition = Transition(
+        obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        action=jnp.zeros((), dtype=int),
+        reward=jnp.zeros((), dtype=float),
+        done=jnp.zeros((), dtype=bool),
+        next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
+    )
+
+    config.system.buffer_size = config.system.total_buffer_size
+    config.system.batch_size = config.system.total_batch_size
+    buffer_fn = fbx.make_item_buffer(
+        max_length=config.system.buffer_size,
+        min_length=config.system.batch_size,
+        sample_batch_size=config.system.batch_size,
+        add_batches=True,
+        add_sequences=True,
+    )
+
+    def train(rng: chex.PRNGKey) -> Tuple[OnlineAndTarget, dict]:
+        """Pure training function - vmappable over seeds.
+
+        Args:
+            rng: JAX PRNGKey for this training run
+
+        Returns:
+            params: Final trained OnlineAndTarget params
+            metrics: Dict of accumulated metrics
+        """
+        # Split RNG for different uses
+        rng, init_rng, env_rng, warmup_rng, train_rng = jax.random.split(rng, 5)
+
+        # Initialize params (different for each seed due to different rng)
+        q_online_params = q_network.init(init_rng, init_x)
+        q_target_params = q_online_params
+        q_opt_state = q_optim.init(q_online_params)
+        params = OnlineAndTarget(q_online_params, q_target_params)
+
+        # Initialize buffer
+        buffer_state = buffer_fn.init(dummy_transition)
+
+        # Initialize environment
+        env_keys = jax.random.split(env_rng, config.arch.num_envs)
+        env_states, timesteps = env.reset(env_keys)
+
+        # Warmup: collect initial transitions
+        def _warmup_step(carry, _):
+            env_state, timestep, buffer_state, key = carry
+            key, policy_key = jax.random.split(key)
+            actor_policy = q_network.apply(params.online, timestep.observation)
+            action = actor_policy.sample(seed=policy_key)
+
+            new_env_state, new_timestep = env.step(env_state, action)
+            done = new_timestep.last().reshape(-1)
+            info = new_timestep.extras["episode_metrics"]
+            next_obs = new_timestep.extras["next_obs"]
+
+            transition = Transition(
+                timestep.observation, action, new_timestep.reward, done, next_obs, info
+            )
+            new_buffer_state = buffer_fn.add(buffer_state, transition)
+
+            return (new_env_state, new_timestep, new_buffer_state, key), None
+
+        (env_states, timesteps, buffer_state, warmup_rng), _ = jax.lax.scan(
+            _warmup_step,
+            (env_states, timesteps, buffer_state, warmup_rng),
+            None,
+            config.system.warmup_steps,
+        )
+
+        # Training step
+        def _train_step(carry, _):
+            params, opt_state, buffer_state, env_state, timestep, key = carry
+
+            # Environment step
+            key, policy_key = jax.random.split(key)
+            actor_policy = q_network.apply(params.online, timestep.observation)
+            action = actor_policy.sample(seed=policy_key)
+
+            new_env_state, new_timestep = env.step(env_state, action)
+            done = new_timestep.last().reshape(-1)
+            info = new_timestep.extras["episode_metrics"]
+            next_obs = new_timestep.extras["next_obs"]
+
+            transition = Transition(
+                timestep.observation, action, new_timestep.reward, done, next_obs, info
+            )
+            new_buffer_state = buffer_fn.add(buffer_state, transition)
+
+            # Multiple gradient updates per environment step (epochs)
+            def _update_epoch(update_carry, _):
+                params, opt_state, key = update_carry
+                key, sample_key = jax.random.split(key)
+
+                # Sample from buffer
+                sample = buffer_fn.sample(new_buffer_state, sample_key)
+                transitions = sample.experience
+
+                # Q-learning loss
+                def _q_loss_fn(q_params, target_q_params, transitions):
+                    q_tm1 = q_network.apply(q_params, transitions.obs).preferences
+                    q_t = q_network.apply(target_q_params, transitions.next_obs).preferences
+                    discount = 1.0 - transitions.done.astype(jnp.float32)
+                    d_t = (discount * config.system.gamma).astype(jnp.float32)
+                    r_t = jnp.clip(
+                        transitions.reward,
+                        -config.system.max_abs_reward,
+                        config.system.max_abs_reward,
+                    ).astype(jnp.float32)
+                    batch_loss = q_learning(
+                        q_tm1, transitions.action, r_t, d_t, q_t,
+                        config.system.huber_loss_parameter,
+                    )
+                    return batch_loss, {"q_loss": batch_loss}
+
+                # Compute gradients and update
+                q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
+                q_grads, loss_info = q_grad_fn(params.online, params.target, transitions)
+
+                q_updates, new_opt_state = q_optim.update(q_grads, opt_state)
+                new_online_params = optax.apply_updates(params.online, q_updates)
+                new_target_params = optax.incremental_update(
+                    new_online_params, params.target, config.system.tau
+                )
+                new_params = OnlineAndTarget(new_online_params, new_target_params)
+
+                return (new_params, new_opt_state, key), loss_info
+
+            key, epoch_key = jax.random.split(key)
+            (new_params, new_opt_state, _), loss_infos = jax.lax.scan(
+                _update_epoch,
+                (params, opt_state, epoch_key),
+                None,
+                config.system.epochs,
+            )
+
+            # Collect metrics
+            metrics = {
+                "episode_return": info["episode_return"],
+                "episode_length": info["episode_length"],
+                "is_terminal": info["is_terminal_step"],
+                "q_loss": jnp.mean(loss_infos["q_loss"]),
+            }
+
+            return (new_params, new_opt_state, new_buffer_state, new_env_state, new_timestep, key), metrics
+
+        # Run training
+        num_updates = config.arch.num_updates
+        init_carry = (params, q_opt_state, buffer_state, env_states, timesteps, train_rng)
+        (final_params, _, _, _, _, _), all_metrics = jax.lax.scan(
+            _train_step, init_carry, None, num_updates
+        )
+
+        return final_params, all_metrics
+
+    return train
+
+
+def run_multiseed_experiment(
+    config: DictConfig,
+    seeds: list,
+    logger: StoixLogger = None,
+) -> Tuple[OnlineAndTarget, dict]:
+    """Run multi-seed training using vmap over seeds.
+
+    This is the PureJaxRL-style approach where we vmap over the pure train function.
+
+    Args:
+        config: Hydra config
+        seeds: List of seed values to train with
+        logger: Optional StoixLogger for logging
+
+    Returns:
+        all_params: Params for each seed (shape: [num_seeds, ...])
+        all_metrics: Metrics for each seed (shape: [num_seeds, num_steps, ...])
+    """
+    import time
+
+    num_seeds = len(seeds)
+    print(f"{Fore.CYAN}{Style.BRIGHT}Running {num_seeds} seeds in parallel: {seeds}{Style.RESET_ALL}")
+
+    # Create the training function
+    train_fn = make_train(config)
+
+    # Create RNGs for each seed
+    seed_array = jnp.array(seeds)
+    rngs = jax.vmap(jax.random.PRNGKey)(seed_array)
+
+    # Vmap and JIT the training function
+    vmapped_train = jax.jit(jax.vmap(train_fn))
+
+    # Run training
+    start_time = time.time()
+    print(f"{Fore.YELLOW}{Style.BRIGHT}Starting JIT compilation...{Style.RESET_ALL}")
+
+    all_params, all_metrics = vmapped_train(rngs)
+    jax.block_until_ready(all_params)
+
+    elapsed_time = time.time() - start_time
+    print(f"{Fore.GREEN}{Style.BRIGHT}Training completed in {elapsed_time:.1f}s{Style.RESET_ALL}")
+
+    # Log results if logger provided
+    if logger is not None:
+        # Log per-seed final metrics
+        for i, seed in enumerate(seeds):
+            # Get final episode return for this seed (where terminal)
+            is_terminal = all_metrics["is_terminal"][i]
+            if jnp.any(is_terminal):
+                terminal_returns = jnp.where(
+                    is_terminal,
+                    all_metrics["episode_return"][i],
+                    jnp.nan,
+                )
+                final_return = jnp.nanmean(terminal_returns)
+            else:
+                final_return = all_metrics["episode_return"][i, -1]
+
+            logger.log(
+                {
+                    f"seed_{seed}/episode_return": float(final_return),
+                    f"seed_{seed}/q_loss": float(jnp.mean(all_metrics["q_loss"][i])),
+                },
+                int(config.arch.total_timesteps),
+                0,
+                LogEvent.EVAL,
+            )
+
+        # Log aggregate metrics
+        final_returns = []
+        for i in range(num_seeds):
+            is_terminal = all_metrics["is_terminal"][i]
+            if jnp.any(is_terminal):
+                terminal_returns = jnp.where(
+                    is_terminal,
+                    all_metrics["episode_return"][i],
+                    jnp.nan,
+                )
+                final_returns.append(float(jnp.nanmean(terminal_returns)))
+            else:
+                final_returns.append(float(all_metrics["episode_return"][i, -1]))
+
+        final_returns = jnp.array(final_returns)
+        logger.log(
+            {
+                "episode_return": float(jnp.mean(final_returns)),
+                "episode_return_std": float(jnp.std(final_returns)),
+            },
+            int(config.arch.total_timesteps),
+            0,
+            LogEvent.EVAL,
+        )
+
+    return all_params, all_metrics
+
+
 def run_experiment(_config: DictConfig) -> float:
-    """Runs experiment."""
+    """Runs experiment (original single-seed with intermediate evaluation)."""
     config = copy.deepcopy(_config)
 
     # Calculate total timesteps.
@@ -562,14 +883,54 @@ def run_experiment(_config: DictConfig) -> float:
     version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
-    """Experiment entry point."""
+    """Experiment entry point.
+
+    Supports multi-seed training via +multiseed=[42,43,44,45,46] argument.
+    When multiseed is provided, uses PureJaxRL-style vmap over seeds.
+    """
     # Allow dynamic attributes.
     OmegaConf.set_struct(cfg, False)
 
-    # Run experiment.
-    eval_performance = run_experiment(cfg)
+    # Check for multi-seed mode
+    multiseed = OmegaConf.select(cfg, "multiseed", default=None)
 
-    print(f"{Fore.CYAN}{Style.BRIGHT}DQN experiment completed{Style.RESET_ALL}")
+    if multiseed is not None:
+        # Multi-seed mode: use PureJaxRL-style vmapped training
+        seeds = list(multiseed)
+        print(f"{Fore.CYAN}{Style.BRIGHT}Multi-seed mode: {seeds}{Style.RESET_ALL}")
+
+        # Setup logger for multi-seed
+        logger = StoixLogger(cfg)
+        logger.log_config(OmegaConf.to_container(cfg, resolve=True))
+
+        # Run multi-seed training
+        all_params, all_metrics = run_multiseed_experiment(cfg, seeds, logger)
+
+        # Stop logger
+        logger.stop()
+
+        # Return mean performance across seeds
+        final_returns = []
+        for i in range(len(seeds)):
+            is_terminal = all_metrics["is_terminal"][i]
+            if jnp.any(is_terminal):
+                terminal_returns = jnp.where(
+                    is_terminal,
+                    all_metrics["episode_return"][i],
+                    jnp.nan,
+                )
+                final_returns.append(float(jnp.nanmean(terminal_returns)))
+            else:
+                final_returns.append(float(all_metrics["episode_return"][i, -1]))
+
+        eval_performance = float(jnp.mean(jnp.array(final_returns)))
+        print(f"{Fore.CYAN}{Style.BRIGHT}DQN multi-seed experiment completed{Style.RESET_ALL}")
+        print(f"Mean return: {eval_performance:.2f} ± {float(jnp.std(jnp.array(final_returns))):.2f}")
+    else:
+        # Single-seed mode: use original implementation
+        eval_performance = run_experiment(cfg)
+        print(f"{Fore.CYAN}{Style.BRIGHT}DQN experiment completed{Style.RESET_ALL}")
+
     return eval_performance
 
 
