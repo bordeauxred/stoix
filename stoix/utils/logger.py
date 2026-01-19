@@ -378,9 +378,9 @@ class JsonLogger(BaseLogger):
         # JsonWriter can't serialize jax arrays
         value = value.item() if isinstance(value, jax.Array) else value
 
-        # Log evaluation, absolute, and actor (training episode) metrics to JSON
-        # TRAIN events are skipped to avoid bloating JSON with per-update losses
-        if event in (LogEvent.ABSOLUTE, LogEvent.EVAL, LogEvent.ACT):
+        # Log evaluation, absolute, actor (training episode), and TRAIN metrics to JSON
+        # TRAIN metrics include losses, grad norms, ortho metrics for offline analysis
+        if event in (LogEvent.ABSOLUTE, LogEvent.EVAL, LogEvent.ACT, LogEvent.TRAIN):
             self.logger.write(step, key, value, eval_step, event == LogEvent.ABSOLUTE)
 
     def log_config(self, config: Dict) -> None:
@@ -531,7 +531,10 @@ class WandBLogger(BaseLogger):
         # Always log seed-specific metrics (e.g., seed_42/episode_return)
         is_seed_metric = key.startswith("seed_")
 
-        if not self.detailed_logging and not is_main_metric and not is_seed_metric:
+        # Always log spectral metrics (critical for isometric network analysis)
+        is_spectral_metric = key.startswith("spectral/")
+
+        if not self.detailed_logging and not is_main_metric and not is_seed_metric and not is_spectral_metric:
             return
 
         # Convert JAX/NumPy scalars
@@ -735,13 +738,22 @@ def log_multiseed_wandb(
 
         # Log metrics over time
         # episode_return shape: (num_updates, rollout_length, num_envs) - only valid at terminal steps
-        # q_loss, actor_loss shape: (num_updates,) - already aggregated per update
+        # q_loss, actor_loss, ortho metrics shape: (num_updates,) - already aggregated per update
         # is_terminal shape: (num_updates, rollout_length, num_envs) - mask for valid episode returns
 
         returns = np.asarray(seed_metrics.get("episode_return", []))
         is_terminal = np.asarray(seed_metrics.get("is_terminal", []))
         q_loss = np.asarray(seed_metrics.get("q_loss", []))
         actor_loss = np.asarray(seed_metrics.get("actor_loss", []))
+
+        # Ortho/isometric network metrics
+        ortho_loss = np.asarray(seed_metrics.get("ortho_loss", []))
+        total_loss = np.asarray(seed_metrics.get("total_loss", []))
+        gram_deviation = np.asarray(seed_metrics.get("gram_deviation", []))
+        grad_norm = np.asarray(seed_metrics.get("grad_norm", []))
+        explained_variance = np.asarray(seed_metrics.get("explained_variance", []))
+        mean_q_value = np.asarray(seed_metrics.get("mean_q_value", []))
+        max_q_value = np.asarray(seed_metrics.get("max_q_value", []))
 
         num_updates = len(q_loss) if len(q_loss) > 0 else len(returns)
 
@@ -763,6 +775,22 @@ def log_multiseed_wandb(
                 log_dict["q_loss"] = float(q_loss[step_idx])
             if len(actor_loss) > step_idx:
                 log_dict["actor_loss"] = float(actor_loss[step_idx])
+
+            # Ortho/isometric network metrics
+            if len(ortho_loss) > step_idx:
+                log_dict["ortho_loss"] = float(ortho_loss[step_idx])
+            if len(total_loss) > step_idx:
+                log_dict["total_loss"] = float(total_loss[step_idx])
+            if len(gram_deviation) > step_idx:
+                log_dict["gram_deviation"] = float(gram_deviation[step_idx])
+            if len(grad_norm) > step_idx:
+                log_dict["grad_norm"] = float(grad_norm[step_idx])
+            if len(explained_variance) > step_idx:
+                log_dict["explained_variance"] = float(explained_variance[step_idx])
+            if len(mean_q_value) > step_idx:
+                log_dict["mean_q_value"] = float(mean_q_value[step_idx])
+            if len(max_q_value) > step_idx:
+                log_dict["max_q_value"] = float(max_q_value[step_idx])
 
             if log_dict:
                 wandb.log(log_dict, step=step_idx * steps_per_log)

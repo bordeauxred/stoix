@@ -3,9 +3,13 @@
 system_name: ff_dqn_ortho  # Name of the system.
 
 # === Orthogonalization Settings ===
-ortho_lambda: 0.2             # Gram regularization strength (0.2 is recommended)
-ortho_exclude_output: true    # Don't constrain final layer
-log_spectral_freq: 10         # Log SVD diagnostics every N evaluations (expensive)
+# ortho_mode: "loss" (default) - apply ortho via loss function: loss += ortho_lambda * gram_loss
+#             "optimizer" - apply ortho via AdamO: decoupled from loss, applied in optimizer
+ortho_mode: loss              # "loss" or "optimizer" (AdamO)
+ortho_lambda: 0.2             # Gram regularization strength for loss mode (0.2 is recommended)
+ortho_coeff: 1e-3             # Ortho coefficient for optimizer mode (AdamO)
+ortho_exclude_output: true    # Don't constrain final layer (for both modes)
+log_spectral_freq: 1          # Log SVD diagnostics every N evaluations (set higher for long runs)
 
 # === Standard DQN Settings ===
 rollout_length: 2             # Number of environment steps per vectorised environment.
