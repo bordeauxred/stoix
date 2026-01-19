@@ -4,8 +4,8 @@ This script fetches results from the stoix_td3_utd_study WandB project
 and computes mean ± std per (environment, UTD) configuration.
 Also identifies the best UTD ratio per environment.
 
-Run naming convention: {algo}_{env}_d{depth}_{activation}_utd{utd}_s{seeds}_{timestamp}
-Example: td3_halfcheetah_d2_silu_utd16_s42-46_20240118_120000
+Run naming convention: {algo}_{env}_d{depth}_{activation}_utd{utd}_{timestamp}_s{seed}
+Example: td3_halfcheetah_d2_silu_utd16_20240118_120000_s42
 
 Usage:
     python experiments/analyze_td3_utd_study.py
@@ -29,13 +29,13 @@ except ImportError:
 def parse_run_name(name: str) -> dict | None:
     """Parse run name into components.
 
-    Expected format: {algo}_{env}_d{depth}_{activation}_utd{utd}_s{seeds}_{timestamp}
-    Example: td3_halfcheetah_d2_silu_utd16_s42-46_20240118_120000
+    Expected format: {algo}_{env}_d{depth}_{activation}_utd{utd}_{timestamp}_s{seed}
+    Example: td3_halfcheetah_d2_silu_utd16_20240118_120000_s42
 
     Also supports legacy format: td3_utd{U}_{env}_{timestamp}
     """
-    # Try new format first
-    new_pattern = r'^(\w+)_(\w+)_d(\d+)_(\w+)_utd(\d+)_s(\d+)-(\d+)_(\d{8}_\d{6})$'
+    # Try new format first: {algo}_{env}_d{depth}_{activation}_utd{utd}_{timestamp}_s{seed}
+    new_pattern = r'^(\w+)_(\w+)_d(\d+)_(\w+)_utd(\d+)_(\d{8}_\d{6})_s(\d+)$'
     match = re.match(new_pattern, name)
     if match:
         return {
@@ -44,9 +44,8 @@ def parse_run_name(name: str) -> dict | None:
             'depth': int(match.group(3)),
             'activation': match.group(4),
             'utd': int(match.group(5)),
-            'seed_start': int(match.group(6)),
-            'seed_end': int(match.group(7)),
-            'timestamp': match.group(8),
+            'timestamp': match.group(6),
+            'seed': int(match.group(7)),
         }
 
     # Try legacy format: td3_utd{U}_{env}_{timestamp}
@@ -59,9 +58,8 @@ def parse_run_name(name: str) -> dict | None:
             'depth': 2,  # default
             'activation': 'silu',  # default
             'utd': int(match.group(1)),
-            'seed_start': 42,
-            'seed_end': 46,
             'timestamp': match.group(3),
+            'seed': None,
         }
 
     return None
@@ -97,7 +95,7 @@ def fetch_utd_study_results(
                 "depth": parsed['depth'],
                 "activation": parsed['activation'],
                 "utd": parsed['utd'],
-                "seeds": f"{parsed['seed_start']}-{parsed['seed_end']}",
+                "seed": parsed.get('seed'),
                 "episode_return": episode_return,
                 "episode_return_std": episode_return_std,
                 "q_loss": summary.get("q_loss", None),
