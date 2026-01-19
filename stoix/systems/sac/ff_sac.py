@@ -34,7 +34,7 @@ from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.total_timestep_checker import check_total_timesteps
-from stoix.utils.training import make_learning_rate
+from stoix.utils.training import make_learning_rate, make_optimizer
 
 
 def get_warmup_fn(
@@ -280,13 +280,15 @@ def get_learner_fn(
                 alpha_loss_info = {"alpha_loss": 0.0, "alpha": alpha}
 
             # UPDATE ACTOR PARAMS AND OPTIMISER STATE
+            # Pass params for AdamO (needs params to compute ortho gradient)
             actor_updates, actor_new_opt_state = actor_update_fn(
-                actor_grads, opt_states.actor_opt_state
+                actor_grads, opt_states.actor_opt_state, params.actor_params
             )
             actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
             # UPDATE Q PARAMS AND OPTIMISER STATE
-            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states.q_opt_state)
+            # Pass params for AdamO (needs params to compute ortho gradient)
+            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states.q_opt_state, params.q_params.online)
             q_new_online_params = optax.apply_updates(params.q_params.online, q_updates)
             # Target network polyak update.
             new_target_q_params = optax.incremental_update(
@@ -381,14 +383,9 @@ def learner_setup(
     actor_lr = make_learning_rate(config.system.actor_lr, config, config.system.epochs)
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
 
-    actor_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(actor_lr, eps=1e-5),
-    )
-    q_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr, eps=1e-5),
-    )
+    # Use make_optimizer for ortho support (supports both "loss" and "optimizer" modes)
+    actor_optim = make_optimizer(actor_lr, config)
+    q_optim = make_optimizer(q_lr, config)
 
     # Initialise observation
     init_x = env.observation_space().generate_value()

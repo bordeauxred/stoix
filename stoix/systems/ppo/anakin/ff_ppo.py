@@ -43,7 +43,7 @@ from stoix.utils.running_statistics import (
     update_statistics,
 )
 from stoix.utils.total_timestep_checker import check_total_timesteps
-from stoix.utils.training import make_learning_rate
+from stoix.utils.training import make_learning_rate, make_optimizer
 
 
 def get_learner_fn(
@@ -261,14 +261,16 @@ def get_learner_fn(
                 )
 
                 # UPDATE ACTOR PARAMS AND OPTIMISER STATE
+                # Pass params for AdamO (needs params to compute ortho gradient)
                 actor_updates, actor_new_opt_state = actor_update_fn(
-                    actor_grads, opt_states.actor_opt_state
+                    actor_grads, opt_states.actor_opt_state, params.actor_params
                 )
                 actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
                 # UPDATE CRITIC PARAMS AND OPTIMISER STATE
+                # Pass params for AdamO (needs params to compute ortho gradient)
                 critic_updates, critic_new_opt_state = critic_update_fn(
-                    critic_grads, opt_states.critic_opt_state
+                    critic_grads, opt_states.critic_opt_state, params.critic_params
                 )
                 critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
 
@@ -453,14 +455,9 @@ def learner_setup(
         config.system.critic_lr, config, config.system.epochs, config.system.num_minibatches
     )
 
-    actor_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(actor_lr, eps=1e-5),
-    )
-    critic_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(critic_lr, eps=1e-5),
-    )
+    # Use make_optimizer for ortho support (supports both "loss" and "optimizer" modes)
+    actor_optim = make_optimizer(actor_lr, config)
+    critic_optim = make_optimizer(critic_lr, config)
 
     # Initialise observation
     init_x = env.observation_space().generate_value()

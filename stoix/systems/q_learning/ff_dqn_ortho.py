@@ -50,6 +50,7 @@ from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import q_learning
 from stoix.utils.orthogonalization import (
+    adamo,
     aggregate_spectral_diagnostics,
     compute_gram_regularization_loss,
     compute_spectral_diagnostics,
@@ -125,7 +126,8 @@ def get_learner_fn(
     buffer_add_fn, buffer_sample_fn = buffer_fns
 
     # Ortho config with defaults
-    ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)
+    ortho_mode = getattr(config.system, "ortho_mode", "loss")  # "loss" or "optimizer"
+    ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
     ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
 
     def _update_step(
@@ -189,7 +191,12 @@ def get_learner_fn(
                 ).astype(jnp.float32)
                 a_tm1 = transitions.action
 
-                # Compute Q-learning loss.
+                # Compute target Q-values for explained variance
+                target_q = r_t + d_t * jnp.max(q_t, axis=-1)
+                # Get predicted Q for selected actions
+                pred_q = q_tm1[jnp.arange(q_tm1.shape[0]), a_tm1]
+
+                # Compute Q-learning loss
                 batch_td_loss = q_learning(
                     q_tm1,
                     a_tm1,
@@ -205,14 +212,33 @@ def get_learner_fn(
                     exclude_output=ortho_exclude_output,
                 )
 
-                # Total loss
-                total_loss = batch_td_loss + ortho_lambda * ortho_loss
+                # Total loss depends on ortho_mode:
+                # - "loss": Add ortho_lambda * ortho_loss to the loss (original approach)
+                # - "optimizer": Ortho is applied in optimizer, not in loss
+                if ortho_mode == "loss":
+                    total_loss = batch_td_loss + ortho_lambda * ortho_loss
+                else:
+                    total_loss = batch_td_loss
+
+                # Explained variance: 1 - Var(y_true - y_pred) / Var(y_true)
+                # Measures how much of the target variance is explained by predictions
+                td_error = target_q - pred_q
+                var_target = jnp.var(target_q)
+                var_residual = jnp.var(td_error)
+                explained_var = 1.0 - var_residual / (var_target + 1e-8)
+
+                # Q-value statistics for monitoring
+                mean_q = jnp.mean(pred_q)
+                max_q = jnp.max(pred_q)
 
                 loss_info = {
                     "q_loss": batch_td_loss,
                     "ortho_loss": ortho_loss,
                     "total_loss": total_loss,
                     "gram_deviation": ortho_info["mean_gram_deviation"],
+                    "explained_variance": explained_var,
+                    "mean_q_value": mean_q,
+                    "max_q_value": max_q,
                 }
 
                 return total_loss, loss_info
@@ -233,6 +259,10 @@ def get_learner_fn(
                 transitions,
             )
 
+            # Compute gradient norm before pmean (for this device/batch)
+            grad_norm = optax.global_norm(q_grads)
+            q_loss_info["grad_norm"] = grad_norm
+
             # Compute the parallel mean (pmean) over the batch.
             # This calculation is inspired by the Anakin architecture demo notebook.
             # available at https://tinyurl.com/26tdzs5x
@@ -241,7 +271,8 @@ def get_learner_fn(
             q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
 
             # UPDATE Q PARAMS AND OPTIMISER STATE
-            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states)
+            # Pass params for AdamO (needs params to compute ortho gradient)
+            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states, params.online)
             q_new_online_params = optax.apply_updates(params.online, q_updates)
             # Target network polyak update.
             new_target_q_params = optax.incremental_update(
@@ -329,11 +360,29 @@ def learner_setup(
     )
     eval_q_network = Actor(torso=q_network_torso, action_head=eval_q_network_action_head)
 
+    # Optimizer selection based on ortho_mode
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
-    q_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr, eps=1e-5),
-    )
+    ortho_mode = getattr(config.system, "ortho_mode", "loss")  # "loss" or "optimizer"
+    ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
+
+    if ortho_mode == "optimizer":
+        # AdamO: Adam with decoupled orthonormalization
+        ortho_coeff = getattr(config.system, "ortho_coeff", 1e-3)
+        q_optim = optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            adamo(
+                learning_rate=q_lr,
+                eps=1e-5,
+                ortho_coeff=ortho_coeff,
+                exclude_output=ortho_exclude_output,
+            ),
+        )
+    else:
+        # Standard Adam (ortho applied via loss)
+        q_optim = optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            optax.adam(q_lr, eps=1e-5),
+        )
 
     # Initialise observation
     init_x = env.observation_space().generate_value()
@@ -509,12 +558,30 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
     )
     q_network = Actor(torso=q_network_torso, action_head=q_network_action_head)
 
-    # Create optimizer
+    # Optimizer selection based on ortho_mode
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
-    q_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr, eps=1e-5),
-    )
+    ortho_mode = getattr(config.system, "ortho_mode", "loss")  # "loss" or "optimizer"
+    ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
+    ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
+
+    if ortho_mode == "optimizer":
+        # AdamO: Adam with decoupled orthonormalization
+        ortho_coeff = getattr(config.system, "ortho_coeff", 1e-3)
+        q_optim = optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            adamo(
+                learning_rate=q_lr,
+                eps=1e-5,
+                ortho_coeff=ortho_coeff,
+                exclude_output=ortho_exclude_output,
+            ),
+        )
+    else:
+        # Standard Adam (ortho applied via loss)
+        q_optim = optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            optax.adam(q_lr, eps=1e-5),
+        )
 
     # Create buffer template
     init_x = env.observation_space().generate_value()
@@ -636,7 +703,7 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                 sample = buffer_fn.sample(new_buffer_state, sample_key)
                 transitions = sample.experience
 
-                # Q-learning loss with Gram regularization
+                # Q-learning loss with optional Gram regularization (depending on ortho_mode)
                 def _q_loss_fn(q_params, target_q_params, transitions):
                     q_tm1 = q_network.apply(q_params, transitions.obs).preferences
                     q_t = q_network.apply(target_q_params, transitions.next_obs).preferences
@@ -647,6 +714,11 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                         -config.system.max_abs_reward,
                         config.system.max_abs_reward,
                     ).astype(jnp.float32)
+
+                    # Compute target Q-values for explained variance
+                    target_q = r_t + d_t * jnp.max(q_t, axis=-1)
+                    # Get predicted Q for selected actions
+                    pred_q = q_tm1[jnp.arange(q_tm1.shape[0]), transitions.action]
 
                     # TD loss
                     batch_td_loss = q_learning(
@@ -664,21 +736,44 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                         exclude_output=ortho_exclude_output,
                     )
 
-                    # Total loss
-                    total_loss = batch_td_loss + ortho_lambda * ortho_loss
+                    # Total loss depends on ortho_mode:
+                    # - "loss": Add ortho_lambda * ortho_loss to the loss (original approach)
+                    # - "optimizer": Ortho is applied in optimizer, not in loss
+                    if ortho_mode == "loss":
+                        total_loss = batch_td_loss + ortho_lambda * ortho_loss
+                    else:
+                        total_loss = batch_td_loss
+
+                    # Explained variance: 1 - Var(y_true - y_pred) / Var(y_true)
+                    td_error = target_q - pred_q
+                    var_target = jnp.var(target_q)
+                    var_residual = jnp.var(td_error)
+                    explained_var = 1.0 - var_residual / (var_target + 1e-8)
+
+                    # Q-value statistics
+                    mean_q = jnp.mean(pred_q)
+                    max_q = jnp.max(pred_q)
 
                     return total_loss, {
                         "q_loss": batch_td_loss,
                         "ortho_loss": ortho_loss,
                         "total_loss": total_loss,
                         "gram_deviation": ortho_info["mean_gram_deviation"],
+                        "explained_variance": explained_var,
+                        "mean_q_value": mean_q,
+                        "max_q_value": max_q,
                     }
 
                 # Compute gradients and update
                 q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
                 q_grads, loss_info = q_grad_fn(params.online, params.target, transitions)
 
-                q_updates, new_opt_state = q_optim.update(q_grads, opt_state)
+                # Compute gradient norm
+                grad_norm = optax.global_norm(q_grads)
+                loss_info["grad_norm"] = grad_norm
+
+                # Pass params for AdamO (needs params to compute ortho gradient)
+                q_updates, new_opt_state = q_optim.update(q_grads, opt_state, params.online)
                 new_online_params = optax.apply_updates(params.online, q_updates)
                 new_target_params = optax.incremental_update(
                     new_online_params, params.target, config.system.tau
@@ -704,6 +799,10 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                 "ortho_loss": jnp.mean(loss_infos["ortho_loss"]),
                 "total_loss": jnp.mean(loss_infos["total_loss"]),
                 "gram_deviation": jnp.mean(loss_infos["gram_deviation"]),
+                "grad_norm": jnp.mean(loss_infos["grad_norm"]),
+                "explained_variance": jnp.mean(loss_infos["explained_variance"]),
+                "mean_q_value": jnp.mean(loss_infos["mean_q_value"]),
+                "max_q_value": jnp.mean(loss_infos["max_q_value"]),
             }
 
             return (
@@ -763,9 +862,14 @@ def run_multiseed_experiment(
     # Run training
     start_time = time.time()
     print(f"{Fore.YELLOW}{Style.BRIGHT}Starting JIT compilation...{Style.RESET_ALL}")
+    print(f"  num_seeds={num_seeds}, total_timesteps={config.arch.total_timesteps}, total_num_envs={config.arch.total_num_envs}")
+    import sys
+    sys.stdout.flush()
 
     all_params, all_metrics = vmapped_train(rngs)
     jax.block_until_ready(all_params)
+    print(f"{Fore.GREEN}{Style.BRIGHT}JIT compilation completed!{Style.RESET_ALL}")
+    sys.stdout.flush()
 
     elapsed_time = time.time() - start_time
     print(f"{Fore.GREEN}{Style.BRIGHT}Training completed in {elapsed_time:.1f}s{Style.RESET_ALL}")
@@ -880,8 +984,8 @@ def run_experiment(_config: DictConfig) -> float:
             **config.logger.checkpointing.save_args,  # Checkpoint args
         )
 
-    # Spectral diagnostics logging frequency
-    log_spectral_freq = getattr(config.system, "log_spectral_freq", 1000)
+    # Spectral diagnostics logging frequency (default: every eval)
+    log_spectral_freq = getattr(config.system, "log_spectral_freq", 1)
 
     # Run experiment for a total number of evaluations.
     max_episode_return = -jnp.inf
@@ -911,13 +1015,15 @@ def run_experiment(_config: DictConfig) -> float:
         train_metrics["steps_per_second"] = opt_steps_per_eval / elapsed_time
         logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
 
-        # Log spectral diagnostics periodically (expensive)
+        # Log spectral diagnostics periodically (expensive due to SVD)
         if eval_step % log_spectral_freq == 0:
             trained_params_for_spectral = unreplicate_batch_dim(
                 learner_output.learner_state.params.online
             )
             spectral_info = compute_spectral_diagnostics(trained_params_for_spectral)
-            spectral_metrics = aggregate_spectral_diagnostics(spectral_info)
+            spectral_metrics = aggregate_spectral_diagnostics(
+                spectral_info, params=trained_params_for_spectral
+            )
             if spectral_metrics:
                 logger.log(spectral_metrics, t, eval_step, LogEvent.TRAIN)
 

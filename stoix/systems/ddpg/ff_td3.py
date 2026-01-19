@@ -37,7 +37,7 @@ from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.total_timestep_checker import check_total_timesteps
-from stoix.utils.training import make_learning_rate
+from stoix.utils.training import make_learning_rate, make_optimizer, make_optimizer_with_mask
 
 
 def get_default_behavior_policy(config: DictConfig, actor_apply_fn: ActorApply) -> Callable:
@@ -283,13 +283,15 @@ def get_learner_fn(
             q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
 
             # UPDATE ACTOR PARAMS AND OPTIMISER STATE
+            # Pass params for AdamO (needs params to compute ortho gradient)
             actor_updates, actor_new_opt_state = actor_update_fn(
-                actor_grads, opt_states.actor_opt_state
+                actor_grads, opt_states.actor_opt_state, params.actor_params.online
             )
             actor_new_online_params = optax.apply_updates(params.actor_params.online, actor_updates)
 
             # UPDATE Q PARAMS AND OPTIMISER STATE
-            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states.q_opt_state)
+            # Pass params for AdamO (needs params to compute ortho gradient)
+            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states.q_opt_state, params.q_params.online)
             q_new_online_params = optax.apply_updates(params.q_params.online, q_updates)
             # Target network polyak update.
             new_target_actor_params, new_target_q_params = optax.incremental_update(
@@ -396,17 +398,9 @@ def learner_setup(
         should_update: bool = jnp.mod(step_count, config.system.policy_frequency) == 0
         return should_update
 
-    actor_optim = optax.conditionally_mask(
-        optax.chain(
-            optax.clip_by_global_norm(config.system.max_grad_norm),
-            optax.adam(actor_lr, eps=1e-5),
-        ),
-        should_transform_fn=delayed_policy_update,
-    )
-    q_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr, eps=1e-5),
-    )
+    # Use make_optimizer for ortho support (supports both "loss" and "optimizer" modes)
+    actor_optim = make_optimizer_with_mask(actor_lr, config, delayed_policy_update)
+    q_optim = make_optimizer(q_lr, config)
 
     # Initialise observation
     init_x = env.observation_space().generate_value()
@@ -603,24 +597,15 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
 
     double_q_network = MultiNetwork([create_q_network(config), create_q_network(config)])
 
-    # Create optimizers
+    # Create optimizers (supports both "loss" and "optimizer" ortho modes)
     actor_lr = make_learning_rate(config.system.actor_lr, config, config.system.epochs)
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
 
     def delayed_policy_update(step_count: int) -> bool:
         return jnp.mod(step_count, config.system.policy_frequency) == 0
 
-    actor_optim = optax.conditionally_mask(
-        optax.chain(
-            optax.clip_by_global_norm(config.system.max_grad_norm),
-            optax.adam(actor_lr, eps=1e-5),
-        ),
-        should_transform_fn=delayed_policy_update,
-    )
-    q_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr, eps=1e-5),
-    )
+    actor_optim = make_optimizer_with_mask(actor_lr, config, delayed_policy_update)
+    q_optim = make_optimizer(q_lr, config)
 
     # Create buffer template
     init_x = env.observation_space().generate_value()
@@ -801,12 +786,12 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                     params.actor_params.online, params.q_params.online, transitions
                 )
 
-                # Update Q
-                q_updates, new_q_opt_state = q_optim.update(q_grads, opt_states.q_opt_state)
+                # Update Q (pass params for AdamO)
+                q_updates, new_q_opt_state = q_optim.update(q_grads, opt_states.q_opt_state, params.q_params.online)
                 new_q_online = optax.apply_updates(params.q_params.online, q_updates)
 
-                # Update actor
-                actor_updates, new_actor_opt_state = actor_optim.update(actor_grads, opt_states.actor_opt_state)
+                # Update actor (pass params for AdamO)
+                actor_updates, new_actor_opt_state = actor_optim.update(actor_grads, opt_states.actor_opt_state, params.actor_params.online)
                 new_actor_online = optax.apply_updates(params.actor_params.online, actor_updates)
 
                 # Target update
