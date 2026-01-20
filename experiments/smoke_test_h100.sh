@@ -2,12 +2,12 @@
 # ============================================================================
 # H100 Smoke Test - Validates ortho support for DQN and TD3
 #
-# Tests:
-# 1. DQN vanilla (no ortho) - baseline still works
-# 2. DQN loss mode - ortho_loss and gram_deviation in logs
-# 3. DQN AdamO mode - runs without ortho_loss in loss
-# 4. TD3 loss mode - q_ortho_loss and actor_ortho_loss in logs
-# 5. TD3 AdamO mode - runs without ortho_loss in loss
+# Tests (AdamO first to verify the fix):
+# 1. DQN AdamO mode - decoupled ortho (THE FIX)
+# 2. TD3 AdamO mode - decoupled ortho (THE FIX)
+# 3. DQN loss mode - ortho_loss in logs
+# 4. TD3 loss mode - q_ortho_loss in logs
+# 5. DQN vanilla - baseline still works
 #
 # Verifies: WandB logging, JSON logging, ortho metrics appear correctly
 # Runtime: ~2-3 minutes
@@ -77,24 +77,24 @@ run_test() {
 touch /tmp/smoke_test_marker
 sleep 1
 
-# Test 1: DQN vanilla (no ortho) - verify baseline still works
-run_test "1/5 DQN vanilla (no ortho)" \
-    "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
-    "q_loss"
+# Test 1: DQN AdamO mode - TEST THE FIX FIRST
+run_test "1/5 DQN + AdamO (decoupled ortho)" \
+    "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=optimizer +system.ortho_coeff=0.001 +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
+    "gram_deviation"
 
 touch /tmp/smoke_test_marker; sleep 1
 
-# Test 2: DQN loss mode - verify ortho_loss appears
-run_test "2/5 DQN + loss ortho" \
+# Test 2: TD3 AdamO mode - TEST THE FIX
+run_test "2/5 TD3 + AdamO (decoupled ortho)" \
+    "uv run python stoix/systems/ddpg/ff_td3.py env=brax/halfcheetah arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort \"network.q_network.pre_torso.layer_sizes=$LAYERS\" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=optimizer +system.ortho_coeff=0.001 +system.ortho_exclude_output=true system.epochs=4 system.warmup_steps=50 logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
+    "gram_deviation"
+
+touch /tmp/smoke_test_marker; sleep 1
+
+# Test 3: DQN loss mode - verify ortho_loss appears
+run_test "3/5 DQN + loss ortho" \
     "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=loss +system.ortho_lambda=0.2 +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
     "ortho_loss"
-
-touch /tmp/smoke_test_marker; sleep 1
-
-# Test 3: DQN AdamO mode
-run_test "3/5 DQN + AdamO" \
-    "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=optimizer +system.ortho_coeff=0.001 +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
-    "q_loss"
 
 touch /tmp/smoke_test_marker; sleep 1
 
@@ -105,9 +105,9 @@ run_test "4/5 TD3 + loss ortho" \
 
 touch /tmp/smoke_test_marker; sleep 1
 
-# Test 5: TD3 AdamO mode
-run_test "5/5 TD3 + AdamO" \
-    "uv run python stoix/systems/ddpg/ff_td3.py env=brax/halfcheetah arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort \"network.q_network.pre_torso.layer_sizes=$LAYERS\" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=optimizer +system.ortho_coeff=0.001 +system.ortho_exclude_output=true system.epochs=4 system.warmup_steps=50 logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
+# Test 5: DQN vanilla (no ortho) - baseline still works
+run_test "5/5 DQN vanilla (baseline)" \
+    "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
     "q_loss"
 
 # Summary
