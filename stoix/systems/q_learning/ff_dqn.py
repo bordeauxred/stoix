@@ -420,7 +420,14 @@ def learner_setup(
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
-    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+    # Custom replicate that skips non-JAX types (strings in AdamO optimizer state)
+    def replicate_with_strings(pytree, devices):
+        def replicate_leaf(x):
+            if not hasattr(x, 'shape'):
+                return x
+            return jax.device_put_replicated(x, devices)
+        return jax.tree_util.tree_map(replicate_leaf, pytree)
+    replicate_learner = replicate_with_strings(replicate_learner, jax.devices())
 
     # Initialise learner state.
     params, opt_states, buffer_states = replicate_learner

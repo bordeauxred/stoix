@@ -13,7 +13,7 @@
 # To run a subset, use: bash overnight_depth_study_h100.sh [start] [end]
 # ============================================================================
 
-set -e
+# Don't use set -e - we want all 32 configs to run even if some fail
 
 # Enable verbose logging
 export JAX_LOG_COMPILES=1
@@ -21,6 +21,8 @@ export PYTHONUNBUFFERED=1
 
 START_IDX=${1:-0}
 END_IDX=${2:-31}
+FAILED=0
+PASSED=0
 
 echo "============================================================"
 echo "Overnight Depth Study - H100"
@@ -112,7 +114,12 @@ for TASK_ID in $(seq $START_IDX $END_IDX); do
             COEFF_ARG="+system.ortho_coeff=0.001"
         fi
 
-        uv run python stoix/systems/q_learning/ff_dqn.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,dqn,${TAG},depth_${DEPTH},${ENV_SHORT}]" logger.loggers.json.enabled=True
+        if uv run python stoix/systems/q_learning/ff_dqn.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,dqn,${TAG},depth_${DEPTH},${ENV_SHORT}]" logger.loggers.json.enabled=True; then
+            ((PASSED++))
+        else
+            ((FAILED++))
+            echo "FAILED: $ALGO $TAG depth=$DEPTH env=$ENV_SHORT"
+        fi
 
     else
         # TD3
@@ -132,7 +139,12 @@ for TASK_ID in $(seq $START_IDX $END_IDX); do
             COEFF_ARG="+system.ortho_coeff=0.001"
         fi
 
-        uv run python stoix/systems/ddpg/ff_td3.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true system.epochs=32 system.warmup_steps=200 system.actor_lr=3e-4 system.q_lr=3e-4 system.decay_learning_rates=false logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,td3,${TAG},depth_${DEPTH},${ENV_SHORT}]" logger.loggers.json.enabled=True
+        if uv run python stoix/systems/ddpg/ff_td3.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true system.epochs=32 system.warmup_steps=200 system.actor_lr=3e-4 system.q_lr=3e-4 system.decay_learning_rates=false logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,td3,${TAG},depth_${DEPTH},${ENV_SHORT}]" logger.loggers.json.enabled=True; then
+            ((PASSED++))
+        else
+            ((FAILED++))
+            echo "FAILED: $ALGO $TAG depth=$DEPTH env=$ENV_SHORT"
+        fi
     fi
 
     echo ""
@@ -142,4 +154,5 @@ done
 echo ""
 echo "============================================================"
 echo "Overnight depth study completed!"
+echo "RESULTS: $PASSED passed, $FAILED failed out of $((END_IDX - START_IDX + 1)) configs"
 echo "============================================================"
