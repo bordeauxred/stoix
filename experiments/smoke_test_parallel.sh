@@ -6,11 +6,26 @@
 # - PPO: 2048 envs (Brax-style on-policy)
 # - TD3/DQN: 1024 envs (Brax-style off-policy)
 #
+# UTD (Update-to-Data) Ratios:
+#   UTD = gradient_updates / transitions_collected
+#
+#   PPO (on-policy):
+#     - 2048 envs × 128 rollout = 262k transitions/cycle
+#     - 4 epochs × 16 minibatches = 64 gradient updates
+#     - Effective: 16k samples per minibatch (very stable gradients)
+#     - Reference: Brax PPO uses 2048 envs × 10 roll × 8 epochs × 32 mini
+#
+#   TD3/DQN (off-policy):
+#     - 1024 envs × 1 step = 1024 transitions/cycle
+#     - 256 epochs = 256 gradient updates
+#     - UTD = 0.25 (matches Raffin SAC-at-Scale with 2048 envs)
+#     - Reference: Original TD3 UTD=1.0, Brax SAC UTD=0.125
+#
 # Tests:
 # 1. PPO baseline @ 2048 envs
 # 2. PPO + AdamO @ 2048 envs
-# 3. TD3 + AdamO @ 1024 envs
-# 4. DQN + AdamO @ 1024 envs
+# 3. TD3 + AdamO @ 1024 envs (epochs=256, UTD=0.25)
+# 4. DQN + AdamO @ 1024 envs (epochs=256, UTD=0.25)
 #
 # Metrics measured:
 # - Steps per second (throughput)
@@ -157,7 +172,7 @@ run_test "TD3 AdamO 1024" \
         arch.total_timesteps=$STEPS \
         arch.total_num_envs=1024 \
         arch.num_evaluation=$NUM_EVAL \
-        system.epochs=32 \
+        system.epochs=256 \
         system.warmup_steps=100 \
         \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" \
         network.actor_network.pre_torso.activation=groupsort \
@@ -181,6 +196,7 @@ run_test "DQN AdamO 1024" \
         arch.total_timesteps=$STEPS \
         arch.total_num_envs=1024 \
         arch.num_evaluation=$NUM_EVAL \
+        system.epochs=256 \
         \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" \
         network.actor_network.pre_torso.activation=groupsort \
         +system.ortho_mode=optimizer \
