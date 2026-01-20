@@ -601,10 +601,16 @@ def _make_run_name(cfg: DictConfig) -> str:
         parts.append(f"d{depth}")
         parts.append(f"w{width}")
 
-    # Ortho regularization (placeholder - add when implemented)
-    # ortho_lambda = OmegaConf.select(cfg, "system.ortho_lambda", default=0)
-    # parts.append(f"ortho{ortho_lambda}" if ortho_lambda > 0 else "no-ortho")
-    parts.append("no-ortho")
+    # Ortho regularization mode
+    ortho_mode = OmegaConf.select(cfg, "system.ortho_mode", default=None)
+    if ortho_mode == "loss":
+        ortho_lambda = OmegaConf.select(cfg, "system.ortho_lambda", default=0.2)
+        parts.append(f"ortho-loss-{ortho_lambda}")
+    elif ortho_mode == "optimizer":
+        ortho_coeff = OmegaConf.select(cfg, "system.ortho_coeff", default=0.001)
+        parts.append(f"ortho-adamo-{ortho_coeff}")
+    else:
+        parts.append("no-ortho")
 
     # Timestamp for uniqueness
     timestamp = datetime.now().strftime("%m%d_%H%M")

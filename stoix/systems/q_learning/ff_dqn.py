@@ -411,7 +411,10 @@ def learner_setup(
     replicate_learner = (params, opt_states, buffer_states)
 
     # Duplicate learner for update_batch_size.
-    def broadcast(x: chex.Array) -> chex.Array:
+    def broadcast(x):
+        # Skip non-array types (e.g., strings in optimizer state)
+        if not hasattr(x, 'shape'):
+            return x
         return jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
 
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
