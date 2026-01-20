@@ -3,7 +3,9 @@ from typing import Callable, List, Optional, Union
 import optax
 from omegaconf import DictConfig
 
-from stoix.utils.orthogonalization import adamo
+# Note: adamo optimizer is deprecated. Use apply_ortho_update() instead.
+# Keeping import for backwards compatibility.
+from stoix.utils.orthogonalization import adamo  # noqa: F401
 
 
 def make_learning_rate_schedule(
@@ -65,21 +67,17 @@ def make_optimizer(
 ) -> optax.GradientTransformation:
     """Create an optimizer based on config settings.
 
-    Supports both standard Adam and AdamO (Adam with decoupled orthonormalization).
-    The ortho_mode config determines which optimizer to use:
-    - "loss": Standard Adam (ortho applied via loss function)
-    - "optimizer": AdamO (ortho decoupled, applied in optimizer)
+    Always uses standard Adam. For ortho_mode="optimizer", the decoupled
+    orthonormalization is applied separately via apply_ortho_update() in
+    the training loop (not inside the optimizer).
 
     Args:
         learning_rate: Learning rate (scalar or schedule)
         config: DictConfig with system settings. Reads:
-            - system.ortho_mode: "loss" or "optimizer" (default: "loss")
-            - system.ortho_coeff: Ortho coefficient for AdamO (default: 1e-3)
-            - system.ortho_exclude_output: Whether to exclude output layer (default: True)
-            - system.max_grad_norm: Max gradient norm for clipping (used if max_grad_norm not provided)
+            - system.max_grad_norm: Max gradient norm for clipping
         max_grad_norm: Override for gradient clipping norm. If None, uses config.system.max_grad_norm
         eps: Adam epsilon
-        exclude_layers: Optional list of layer name patterns to exclude from ortho
+        exclude_layers: Unused, kept for backwards compatibility
 
     Returns:
         optax.GradientTransformation optimizer
@@ -91,30 +89,18 @@ def make_optimizer(
 
         # With custom grad norm:
         actor_optim = make_optimizer(actor_lr, config, max_grad_norm=1.0)
+
+    Note:
+        For ortho_mode="optimizer", call apply_ortho_update() after
+        optax.apply_updates() in the training loop.
     """
-    # Get config values with defaults
-    ortho_mode = getattr(config.system, "ortho_mode", "loss")
     grad_norm = max_grad_norm if max_grad_norm is not None else getattr(config.system, "max_grad_norm", 0.5)
 
-    if ortho_mode == "optimizer":
-        # AdamO: Adam with decoupled orthonormalization
-        ortho_coeff = getattr(config.system, "ortho_coeff", 1e-3)
-        ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(grad_norm),
-            adamo(
-                learning_rate=learning_rate,
-                eps=eps,
-                ortho_coeff=ortho_coeff,
-                exclude_output=ortho_exclude_output,
-            ),
-        )
-    else:
-        # Standard Adam (ortho applied via loss function if enabled)
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(grad_norm),
-            optax.adam(learning_rate, eps=eps),
-        )
+    # Always use standard Adam (ortho applied separately if mode="optimizer")
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(grad_norm),
+        optax.adam(learning_rate, eps=eps),
+    )
 
     return optimizer
 

@@ -30,7 +30,7 @@ from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import q_learning
-from stoix.utils.orthogonalization import compute_gram_regularization_loss
+from stoix.utils.orthogonalization import apply_ortho_update, compute_gram_regularization_loss
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate, make_optimizer
 
@@ -104,7 +104,10 @@ def get_learner_fn(
     # Ortho config with defaults
     ortho_mode = getattr(config.system, "ortho_mode", None)  # None, "loss", or "optimizer"
     ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
+    ortho_coeff = getattr(config.system, "ortho_coeff", 1e-3)  # for optimizer mode
     ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
+    # Get learning rate for decoupled ortho
+    q_lr_value = getattr(config.system, "q_lr", 1e-3)
 
     def _update_step(
         learner_state: OffPolicyLearnerState, _: Any
@@ -221,9 +224,15 @@ def get_learner_fn(
             q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
 
             # UPDATE Q PARAMS AND OPTIMISER STATE
-            # Pass params for AdamO (needs params to compute ortho gradient)
             q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states, params.online)
             q_new_online_params = optax.apply_updates(params.online, q_updates)
+
+            # Apply decoupled ortho regularization if mode="optimizer"
+            if ortho_mode == "optimizer":
+                q_new_online_params = apply_ortho_update(
+                    q_new_online_params, q_lr_value, ortho_coeff, ortho_exclude_output
+                )
+
             # Target network polyak update.
             new_target_q_params = optax.incremental_update(
                 q_new_online_params, params.target, config.system.tau
@@ -420,14 +429,8 @@ def learner_setup(
     replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
-    # Custom replicate that skips non-JAX types (strings in AdamO optimizer state)
-    def replicate_with_strings(pytree, devices):
-        def replicate_leaf(x):
-            if not hasattr(x, 'shape'):
-                return x
-            return jax.device_put_replicated(x, devices)
-        return jax.tree_util.tree_map(replicate_leaf, pytree)
-    replicate_learner = replicate_with_strings(replicate_learner, jax.devices())
+    # Note: Now using standard Adam (no strings in state), so flax.jax_utils.replicate works.
+    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
 
     # Initialise learner state.
     params, opt_states, buffer_states = replicate_learner
@@ -504,7 +507,10 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
     # Ortho config with defaults
     ortho_mode = getattr(config.system, "ortho_mode", None)  # None, "loss", or "optimizer"
     ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
+    ortho_coeff = getattr(config.system, "ortho_coeff", 1e-3)  # for optimizer mode
     ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
+    # Get learning rate for decoupled ortho
+    q_lr_value = getattr(config.system, "q_lr", 1e-3)
 
     # Create buffer template
     init_x = env.observation_space().generate_value()
@@ -672,9 +678,15 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                 q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
                 q_grads, loss_info = q_grad_fn(params.online, params.target, transitions)
 
-                # Pass params for AdamO (needs params to compute ortho gradient)
                 q_updates, new_opt_state = q_optim.update(q_grads, opt_state, params.online)
                 new_online_params = optax.apply_updates(params.online, q_updates)
+
+                # Apply decoupled ortho regularization if mode="optimizer"
+                if ortho_mode == "optimizer":
+                    new_online_params = apply_ortho_update(
+                        new_online_params, q_lr_value, ortho_coeff, ortho_exclude_output
+                    )
+
                 new_target_params = optax.incremental_update(
                     new_online_params, params.target, config.system.tau
                 )

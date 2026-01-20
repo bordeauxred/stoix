@@ -572,3 +572,82 @@ def adamo(
         )
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+# =============================================================================
+# Stateless Decoupled Orthonormalization (Option E)
+#
+# This approach computes param eligibility on-the-fly during JAX tracing,
+# avoiding any strings in optimizer state. No pmap/replicate issues.
+# =============================================================================
+
+
+def apply_ortho_update(
+    params: FrozenDict,
+    lr: float,
+    ortho_coeff: float,
+    exclude_output: bool = True,
+) -> FrozenDict:
+    """Apply decoupled orthonormalization update.
+
+    Stateless - computes param eligibility on-the-fly during tracing.
+    No stored state means no pmap/replicate issues.
+
+    This is the "Option E" approach: instead of storing which params to
+    regularize in optimizer state, we determine eligibility at trace time
+    by inspecting the pytree paths.
+
+    Args:
+        params: Parameter pytree (e.g., params.online for DQN)
+        lr: Current learning rate
+        ortho_coeff: Orthonormalization strength (recommended: 1e-3)
+        exclude_output: Skip output layer (detected by heuristic)
+
+    Returns:
+        Updated params with ortho regularization applied to eligible kernels.
+
+    Example:
+        # In training loop, after Adam update:
+        new_params = optax.apply_updates(params, updates)
+        if ortho_mode == "optimizer":
+            new_params = apply_ortho_update(new_params, lr, ortho_coeff)
+    """
+    # Find output layer once (happens during tracing, not execution)
+    output_layer_path = None
+    if exclude_output:
+        kernels = get_dense_kernels(params)
+        if kernels:
+            output_layer_path = _find_output_layer_path(list(kernels.keys()))
+
+    def update_param(path, param):
+        # Convert path tuple to string for matching
+        path_str = "/".join(str(k) for k in path)
+
+        # Only apply to 2D kernels (Dense layer weights)
+        if not path_str.endswith("kernel"):
+            return param
+        if not _is_array_like(param) or param.ndim != 2:
+            return param
+
+        # Skip output layer if configured
+        if output_layer_path and path_str == output_layer_path:
+            return param
+
+        # Compute ortho gradient: d/dW ||W^T W - I||^2
+        n_in, n_out = param.shape
+        is_wide = n_in < n_out
+
+        if is_wide:
+            # Wide: WW^T should be (n_out/n_in) * I
+            gram = param @ param.T
+            scale = n_out / n_in
+            ortho_grad = 2.0 * (gram @ param - scale * param)
+        else:
+            # Tall/Square: W^TW should be I
+            gram = param.T @ param
+            ortho_grad = 2.0 * (param @ gram - param)
+
+        # Decoupled update: params -= lr * coeff * grad
+        return param - lr * ortho_coeff * ortho_grad
+
+    return jax.tree_util.tree_map_with_path(update_param, params)
