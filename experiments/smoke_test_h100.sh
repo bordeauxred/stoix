@@ -62,7 +62,7 @@ echo ""
 echo "------------------------------------------------------------"
 echo "[3/4] TD3 + Loss-based ortho"
 echo "------------------------------------------------------------"
-if uv run python stoix/systems/ddpg/ff_td3.py env=brax/halfcheetah arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=loss +system.ortho_lambda=0.2 +system.ortho_exclude_output=true +system.log_spectral_freq=1000000 logger.loggers.wandb.enabled=False; then
+if uv run python stoix/systems/ddpg/ff_td3.py env=brax/halfcheetah arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=loss +system.ortho_lambda=0.2 +system.ortho_exclude_output=true +system.log_spectral_freq=1000000 system.epochs=32 system.warmup_steps=200 system.actor_lr=3e-4 system.q_lr=3e-4 system.decay_learning_rates=false logger.loggers.wandb.enabled=False; then
     echo "PASSED"
     ((PASSED++))
 else
@@ -75,7 +75,7 @@ echo ""
 echo "------------------------------------------------------------"
 echo "[4/4] TD3 + AdamO"
 echo "------------------------------------------------------------"
-if uv run python stoix/systems/ddpg/ff_td3.py env=brax/halfcheetah arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=optimizer +system.ortho_coeff=0.001 +system.ortho_exclude_output=true +system.log_spectral_freq=1000000 logger.loggers.wandb.enabled=False; then
+if uv run python stoix/systems/ddpg/ff_td3.py env=brax/halfcheetah arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=optimizer +system.ortho_coeff=0.001 +system.ortho_exclude_output=true +system.log_spectral_freq=1000000 system.epochs=32 system.warmup_steps=200 system.actor_lr=3e-4 system.q_lr=3e-4 system.decay_learning_rates=false logger.loggers.wandb.enabled=False; then
     echo "PASSED"
     ((PASSED++))
 else
