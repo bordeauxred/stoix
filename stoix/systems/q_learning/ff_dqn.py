@@ -30,8 +30,9 @@ from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
 from stoix.utils.loss import q_learning
+from stoix.utils.orthogonalization import compute_gram_regularization_loss
 from stoix.utils.total_timestep_checker import check_total_timesteps
-from stoix.utils.training import make_learning_rate
+from stoix.utils.training import make_learning_rate, make_optimizer
 
 
 def get_warmup_fn(
@@ -100,6 +101,11 @@ def get_learner_fn(
 
     buffer_add_fn, buffer_sample_fn = buffer_fns
 
+    # Ortho config with defaults
+    ortho_mode = getattr(config.system, "ortho_mode", None)  # None, "loss", or "optimizer"
+    ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
+    ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
+
     def _update_step(
         learner_state: OffPolicyLearnerState, _: Any
     ) -> Tuple[OffPolicyLearnerState, Tuple]:
@@ -148,7 +154,7 @@ def get_learner_fn(
                 q_params: FrozenDict,
                 target_q_params: FrozenDict,
                 transitions: Transition,
-            ) -> jnp.ndarray:
+            ) -> Tuple[jnp.ndarray, dict]:
 
                 q_tm1 = q_apply_fn(q_params, transitions.obs).preferences
                 q_t = q_apply_fn(target_q_params, transitions.next_obs).preferences
@@ -162,7 +168,7 @@ def get_learner_fn(
                 a_tm1 = transitions.action
 
                 # Compute Q-learning loss.
-                batch_loss = q_learning(
+                batch_td_loss = q_learning(
                     q_tm1,
                     a_tm1,
                     r_t,
@@ -171,11 +177,25 @@ def get_learner_fn(
                     config.system.huber_loss_parameter,
                 )
 
-                loss_info = {
-                    "q_loss": batch_loss,
-                }
+                # Compute ortho regularization loss when in "loss" mode
+                if ortho_mode == "loss":
+                    ortho_loss, ortho_info = compute_gram_regularization_loss(
+                        q_params, exclude_output=ortho_exclude_output
+                    )
+                    total_loss = batch_td_loss + ortho_lambda * ortho_loss
+                    loss_info = {
+                        "q_loss": batch_td_loss,
+                        "ortho_loss": ortho_loss,
+                        "total_loss": total_loss,
+                        "gram_deviation": ortho_info["mean_gram_deviation"],
+                    }
+                else:
+                    total_loss = batch_td_loss
+                    loss_info = {
+                        "q_loss": batch_td_loss,
+                    }
 
-                return batch_loss, loss_info
+                return total_loss, loss_info
 
             params, opt_states, buffer_state, key = update_state
 
@@ -201,7 +221,8 @@ def get_learner_fn(
             q_grads, q_loss_info = jax.lax.pmean((q_grads, q_loss_info), axis_name="device")
 
             # UPDATE Q PARAMS AND OPTIMISER STATE
-            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states)
+            # Pass params for AdamO (needs params to compute ortho gradient)
+            q_updates, q_new_opt_state = q_update_fn(q_grads, opt_states, params.online)
             q_new_online_params = optax.apply_updates(params.online, q_updates)
             # Target network polyak update.
             new_target_q_params = optax.incremental_update(
@@ -290,10 +311,7 @@ def learner_setup(
     eval_q_network = Actor(torso=q_network_torso, action_head=eval_q_network_action_head)
 
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
-    q_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr, eps=1e-5),
-    )
+    q_optim = make_optimizer(q_lr, config)
 
     # Initialise observation
     init_x = env.observation_space().generate_value()
@@ -469,12 +487,14 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
     )
     q_network = Actor(torso=q_network_torso, action_head=q_network_action_head)
 
-    # Create optimizer
+    # Create optimizer (supports both standard Adam and AdamO based on ortho_mode)
     q_lr = make_learning_rate(config.system.q_lr, config, config.system.epochs)
-    q_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(q_lr, eps=1e-5),
-    )
+    q_optim = make_optimizer(q_lr, config)
+
+    # Ortho config with defaults
+    ortho_mode = getattr(config.system, "ortho_mode", None)  # None, "loss", or "optimizer"
+    ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
+    ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
 
     # Create buffer template
     init_x = env.observation_space().generate_value()
@@ -607,7 +627,7 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                 sample = buffer_fn.sample(new_buffer_state, sample_key)
                 transitions = sample.experience
 
-                # Q-learning loss
+                # Q-learning loss with optional ortho regularization
                 def _q_loss_fn(q_params, target_q_params, transitions):
                     q_tm1 = q_network.apply(q_params, transitions.obs).preferences
                     q_t = q_network.apply(target_q_params, transitions.next_obs).preferences
@@ -618,17 +638,32 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                         -config.system.max_abs_reward,
                         config.system.max_abs_reward,
                     ).astype(jnp.float32)
-                    batch_loss = q_learning(
+                    batch_td_loss = q_learning(
                         q_tm1, transitions.action, r_t, d_t, q_t,
                         config.system.huber_loss_parameter,
                     )
-                    return batch_loss, {"q_loss": batch_loss}
+
+                    # Compute ortho regularization loss when in "loss" mode
+                    if ortho_mode == "loss":
+                        ortho_loss, ortho_info = compute_gram_regularization_loss(
+                            q_params, exclude_output=ortho_exclude_output
+                        )
+                        total_loss = batch_td_loss + ortho_lambda * ortho_loss
+                        return total_loss, {
+                            "q_loss": batch_td_loss,
+                            "ortho_loss": ortho_loss,
+                            "total_loss": total_loss,
+                            "gram_deviation": ortho_info["mean_gram_deviation"],
+                        }
+                    else:
+                        return batch_td_loss, {"q_loss": batch_td_loss}
 
                 # Compute gradients and update
                 q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
                 q_grads, loss_info = q_grad_fn(params.online, params.target, transitions)
 
-                q_updates, new_opt_state = q_optim.update(q_grads, opt_state)
+                # Pass params for AdamO (needs params to compute ortho gradient)
+                q_updates, new_opt_state = q_optim.update(q_grads, opt_state, params.online)
                 new_online_params = optax.apply_updates(params.online, q_updates)
                 new_target_params = optax.incremental_update(
                     new_online_params, params.target, config.system.tau
@@ -653,6 +688,10 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                 "is_terminal": traj_batch.info["is_terminal_step"],
                 "q_loss": q_loss_mean,
             }
+            # Add ortho metrics if in loss mode
+            if ortho_mode == "loss":
+                metrics["ortho_loss"] = jnp.mean(loss_infos["ortho_loss"])
+                metrics["gram_deviation"] = jnp.mean(loss_infos["gram_deviation"])
 
             # Compute episode return (mean over terminal steps)
             is_terminal = traj_batch.info["is_terminal_step"]

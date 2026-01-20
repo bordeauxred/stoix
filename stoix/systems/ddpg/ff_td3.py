@@ -36,6 +36,7 @@ from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from stoix.utils.logger import LogEvent, StoixLogger
+from stoix.utils.orthogonalization import compute_gram_regularization_loss
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate, make_optimizer, make_optimizer_with_mask
 
@@ -129,6 +130,11 @@ def get_learner_fn(
     buffer_add_fn, buffer_sample_fn = buffer_fns
     exploratory_actor_apply = get_default_behavior_policy(config, actor_apply_fn)
 
+    # Ortho config with defaults
+    ortho_mode = getattr(config.system, "ortho_mode", None)  # None, "loss", or "optimizer"
+    ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
+    ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
+
     def _update_step(
         learner_state: OffPolicyLearnerState, _: Any
     ) -> Tuple[OffPolicyLearnerState, Tuple]:
@@ -180,7 +186,7 @@ def get_learner_fn(
                 target_actor_params: FrozenDict,
                 transitions: Transition,
                 rng_key: chex.PRNGKey,
-            ) -> jnp.ndarray:
+            ) -> Tuple[jnp.ndarray, dict]:
 
                 q_tm1 = q_apply_fn(q_params, transitions.obs, transitions.action)
                 action_scale = (config.system.action_maximum - config.system.action_minimum) / 2
@@ -218,13 +224,24 @@ def get_learner_fn(
                     "q2_pred": jnp.mean(q_t[..., 1]),
                 }
 
-                return q_loss, loss_info
+                # Compute ortho regularization loss when in "loss" mode
+                if ortho_mode == "loss":
+                    ortho_loss, ortho_info = compute_gram_regularization_loss(
+                        q_params, exclude_output=ortho_exclude_output
+                    )
+                    total_loss = q_loss + ortho_lambda * ortho_loss
+                    loss_info["q_ortho_loss"] = ortho_loss
+                    loss_info["q_gram_deviation"] = ortho_info["mean_gram_deviation"]
+                else:
+                    total_loss = q_loss
+
+                return total_loss, loss_info
 
             def _actor_loss_fn(
                 actor_params: FrozenDict,
                 q_params: FrozenDict,
                 transitions: Transition,
-            ) -> chex.Array:
+            ) -> Tuple[chex.Array, dict]:
                 o_t = transitions.obs
                 a_t = (
                     actor_apply_fn(actor_params, o_t)
@@ -238,7 +255,19 @@ def get_learner_fn(
                 loss_info = {
                     "actor_loss": actor_loss,
                 }
-                return actor_loss, loss_info
+
+                # Compute ortho regularization loss when in "loss" mode
+                if ortho_mode == "loss":
+                    ortho_loss, ortho_info = compute_gram_regularization_loss(
+                        actor_params, exclude_output=ortho_exclude_output
+                    )
+                    total_loss = actor_loss + ortho_lambda * ortho_loss
+                    loss_info["actor_ortho_loss"] = ortho_loss
+                    loss_info["actor_gram_deviation"] = ortho_info["mean_gram_deviation"]
+                else:
+                    total_loss = actor_loss
+
+                return total_loss, loss_info
 
             params, opt_states, buffer_state, key = update_state
 
@@ -607,6 +636,11 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
     actor_optim = make_optimizer_with_mask(actor_lr, config, delayed_policy_update)
     q_optim = make_optimizer(q_lr, config)
 
+    # Ortho config with defaults
+    ortho_mode = getattr(config.system, "ortho_mode", None)  # None, "loss", or "optimizer"
+    ortho_lambda = getattr(config.system, "ortho_lambda", 0.2)  # for loss mode
+    ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
+
     # Create buffer template
     init_x = env.observation_space().generate_value()
     init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
@@ -748,7 +782,7 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                 sample = buffer_fn.sample(new_buffer_state, sample_key)
                 transitions = sample.experience
 
-                # Q-loss
+                # Q-loss with optional ortho regularization
                 def _q_loss_fn(q_params, target_q_params, target_actor_params, transitions, rng_key):
                     q_tm1 = double_q_network.apply(q_params, transitions.obs, transitions.action)
                     noise = jax.random.normal(rng_key, transitions.action.shape) * config.system.policy_noise
@@ -765,14 +799,43 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                     target_q = jax.lax.stop_gradient(r_t + d_t * next_v)
                     q_error = q_tm1 - jnp.expand_dims(target_q, -1)
                     q_loss = 0.5 * jnp.mean(jnp.square(q_error))
-                    return q_loss, {"q_loss": q_loss}
 
-                # Actor loss
+                    loss_info = {"q_loss": q_loss}
+
+                    # Compute ortho regularization loss when in "loss" mode
+                    if ortho_mode == "loss":
+                        ortho_loss, ortho_info = compute_gram_regularization_loss(
+                            q_params, exclude_output=ortho_exclude_output
+                        )
+                        total_loss = q_loss + ortho_lambda * ortho_loss
+                        loss_info["q_ortho_loss"] = ortho_loss
+                        loss_info["q_gram_deviation"] = ortho_info["mean_gram_deviation"]
+                    else:
+                        total_loss = q_loss
+
+                    return total_loss, loss_info
+
+                # Actor loss with optional ortho regularization
                 def _actor_loss_fn(actor_params, q_params, transitions):
                     a_t = actor_network.apply(actor_params, transitions.obs).mode()
                     a_t = a_t.clip(config.system.action_minimum, config.system.action_maximum)
                     q_value = double_q_network.apply(q_params, transitions.obs, a_t)
-                    return -jnp.mean(q_value), {"actor_loss": -jnp.mean(q_value)}
+                    actor_loss = -jnp.mean(q_value)
+
+                    loss_info = {"actor_loss": actor_loss}
+
+                    # Compute ortho regularization loss when in "loss" mode
+                    if ortho_mode == "loss":
+                        ortho_loss, ortho_info = compute_gram_regularization_loss(
+                            actor_params, exclude_output=ortho_exclude_output
+                        )
+                        total_loss = actor_loss + ortho_lambda * ortho_loss
+                        loss_info["actor_ortho_loss"] = ortho_loss
+                        loss_info["actor_gram_deviation"] = ortho_info["mean_gram_deviation"]
+                    else:
+                        total_loss = actor_loss
+
+                    return total_loss, loss_info
 
                 # Compute gradients
                 q_grad_fn = jax.grad(_q_loss_fn, has_aux=True)
@@ -828,6 +891,12 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                 "q_loss": q_loss_mean,
                 "actor_loss": actor_loss_mean,
             }
+            # Add ortho metrics if in loss mode
+            if ortho_mode == "loss":
+                metrics["q_ortho_loss"] = jnp.mean(loss_infos["q_ortho_loss"])
+                metrics["q_gram_deviation"] = jnp.mean(loss_infos["q_gram_deviation"])
+                metrics["actor_ortho_loss"] = jnp.mean(loss_infos["actor_ortho_loss"])
+                metrics["actor_gram_deviation"] = jnp.mean(loss_infos["actor_gram_deviation"])
 
             # Compute episode return (mean over terminal steps)
             is_terminal = traj_batch.info["is_terminal_step"]
