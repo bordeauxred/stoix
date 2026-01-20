@@ -44,6 +44,10 @@ from stoix.utils.running_statistics import (
 )
 from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate, make_optimizer
+from stoix.utils.orthogonalization import (
+    compute_gram_regularization_loss,
+    apply_ortho_update,
+)
 
 
 def get_learner_fn(
@@ -57,6 +61,12 @@ def get_learner_fn(
     # Get apply and update functions for actor and critic networks.
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
+
+    # Extract ortho config
+    ortho_mode = getattr(config.system, "ortho_mode", None)
+    ortho_lambda = getattr(config.system, "ortho_lambda", 0.0)
+    ortho_coeff = getattr(config.system, "ortho_coeff", 0.001)
+    ortho_exclude_output = getattr(config.system, "ortho_exclude_output", True)
 
     def _update_step(
         learner_state: OnPolicyLearnerState, _: Any
@@ -205,10 +215,23 @@ def get_learner_fn(
                     entropy = actor_policy.entropy().mean()
 
                     total_loss_actor = loss_actor - config.system.ent_coef * entropy
+
+                    # Add ortho loss if loss mode
+                    actor_ortho_loss = jnp.array(0.0)
+                    actor_gram_deviation = jnp.array(0.0)
+                    if ortho_mode == "loss":
+                        actor_ortho_loss, ortho_info = compute_gram_regularization_loss(
+                            actor_params, exclude_output=ortho_exclude_output
+                        )
+                        actor_gram_deviation = ortho_info["mean_gram_deviation"]
+                        total_loss_actor = total_loss_actor + ortho_lambda * actor_ortho_loss
+
                     loss_info = {
                         "actor_loss": loss_actor,
                         "entropy": entropy,
                         "advantages": gae,
+                        "actor_ortho_loss": actor_ortho_loss,
+                        "actor_gram_deviation": actor_gram_deviation,
                     }
                     return total_loss_actor, loss_info
 
@@ -227,10 +250,23 @@ def get_learner_fn(
                     )
 
                     critic_total_loss = config.system.vf_coef * value_loss
+
+                    # Add ortho loss if loss mode
+                    critic_ortho_loss = jnp.array(0.0)
+                    critic_gram_deviation = jnp.array(0.0)
+                    if ortho_mode == "loss":
+                        critic_ortho_loss, ortho_info = compute_gram_regularization_loss(
+                            critic_params, exclude_output=ortho_exclude_output
+                        )
+                        critic_gram_deviation = ortho_info["mean_gram_deviation"]
+                        critic_total_loss = critic_total_loss + ortho_lambda * critic_ortho_loss
+
                     loss_info = {
                         "value_loss": value_loss,
                         "pred_value": value,
                         "target_value": targets,
+                        "critic_ortho_loss": critic_ortho_loss,
+                        "critic_gram_deviation": critic_gram_deviation,
                     }
                     return critic_total_loss, loss_info
 
@@ -267,12 +303,32 @@ def get_learner_fn(
                 )
                 actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
+                # Apply ortho update for optimizer mode (actor)
+                actor_ortho_info = {"gram_deviation": jnp.array(0.0), "num_ortho_layers": 0}
+                if ortho_mode == "optimizer":
+                    actor_new_params, actor_ortho_info = apply_ortho_update(
+                        actor_new_params,
+                        config.system.actor_lr,
+                        ortho_coeff,
+                        ortho_exclude_output,
+                    )
+
                 # UPDATE CRITIC PARAMS AND OPTIMISER STATE
                 # Pass params for AdamO (needs params to compute ortho gradient)
                 critic_updates, critic_new_opt_state = critic_update_fn(
                     critic_grads, opt_states.critic_opt_state, params.critic_params
                 )
                 critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
+
+                # Apply ortho update for optimizer mode (critic)
+                critic_ortho_info = {"gram_deviation": jnp.array(0.0), "num_ortho_layers": 0}
+                if ortho_mode == "optimizer":
+                    critic_new_params, critic_ortho_info = apply_ortho_update(
+                        critic_new_params,
+                        config.system.critic_lr,
+                        ortho_coeff,
+                        ortho_exclude_output,
+                    )
 
                 # PACK NEW PARAMS AND OPTIMISER STATE
                 new_params = ActorCriticParams(actor_new_params, critic_new_params)
@@ -283,6 +339,11 @@ def get_learner_fn(
                     **actor_loss_info,
                     **critic_loss_info,
                 }
+                # Add optimizer mode ortho metrics
+                if ortho_mode == "optimizer":
+                    loss_info["actor_gram_deviation"] = actor_ortho_info["gram_deviation"]
+                    loss_info["critic_gram_deviation"] = critic_ortho_info["gram_deviation"]
+
                 return (new_params, new_opt_state), loss_info
 
             (
