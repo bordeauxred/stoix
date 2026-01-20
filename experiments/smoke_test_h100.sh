@@ -13,7 +13,7 @@
 # Runtime: ~2-3 minutes
 # ============================================================================
 
-set -e
+# Don't use set -e - we want all tests to run even if some fail
 
 export JAX_LOG_COMPILES=0
 export PYTHONUNBUFFERED=1
@@ -32,6 +32,7 @@ LAYERS="[128,128,128,128]"
 
 PASSED=0
 FAILED=0
+# JSON path: results/json/{system_name}/{unique_token}/*.json
 RESULTS_DIR="results/json"
 
 run_test() {
@@ -47,51 +48,62 @@ run_test() {
     if eval "$cmd"; then
         echo "  Run: OK"
 
-        # Check for JSON output
-        json_file=$(ls -t $RESULTS_DIR/*/metrics.json 2>/dev/null | head -1)
+        # Check for JSON output - path is results/json/{system_name}/{token}/*.json
+        json_file=$(find $RESULTS_DIR -name "*.json" -type f -newer /tmp/smoke_test_marker 2>/dev/null | head -1)
         if [ -n "$json_file" ] && [ -f "$json_file" ]; then
             if grep -q "$check_metric" "$json_file"; then
-                echo "  JSON: OK (found $check_metric)"
+                echo "  JSON: OK (found $check_metric in $json_file)"
                 ((PASSED++))
             else
                 echo "  JSON: FAILED (missing $check_metric)"
                 echo "    File: $json_file"
-                echo "    Sample: $(head -c 500 "$json_file")"
+                echo "    Content sample: $(head -c 300 "$json_file")"
                 ((FAILED++))
             fi
         else
-            echo "  JSON: FAILED (no metrics.json found)"
+            echo "  JSON: FAILED (no json file found in $RESULTS_DIR)"
+            ls -la $RESULTS_DIR 2>/dev/null || echo "  Directory doesn't exist"
+            find $RESULTS_DIR -name "*.json" 2>/dev/null | head -5 || true
             ((FAILED++))
         fi
     else
-        echo "  Run: FAILED"
+        echo "  Run: FAILED (exit code $?)"
         ((FAILED++))
     fi
     echo ""
 }
 
-# Clean old results
-rm -rf $RESULTS_DIR 2>/dev/null || true
+# Create marker file to find new json files
+touch /tmp/smoke_test_marker
+sleep 1
 
 # Test 1: DQN vanilla (no ortho) - verify baseline still works
 run_test "1/5 DQN vanilla (no ortho)" \
     "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
     "q_loss"
 
+touch /tmp/smoke_test_marker; sleep 1
+
 # Test 2: DQN loss mode - verify ortho_loss appears
 run_test "2/5 DQN + loss ortho" \
     "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=loss +system.ortho_lambda=0.2 +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
     "ortho_loss"
+
+touch /tmp/smoke_test_marker; sleep 1
 
 # Test 3: DQN AdamO mode
 run_test "3/5 DQN + AdamO" \
     "uv run python stoix/systems/q_learning/ff_dqn.py env=gymnax/cartpole arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=optimizer +system.ortho_coeff=0.001 +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
     "q_loss"
 
+touch /tmp/smoke_test_marker; sleep 1
+
 # Test 4: TD3 loss mode - verify q_ortho_loss appears
 run_test "4/5 TD3 + loss ortho" \
     "uv run python stoix/systems/ddpg/ff_td3.py env=brax/halfcheetah arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL \"network.actor_network.pre_torso.layer_sizes=$LAYERS\" network.actor_network.pre_torso.activation=groupsort \"network.q_network.pre_torso.layer_sizes=$LAYERS\" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=loss +system.ortho_lambda=0.2 +system.ortho_exclude_output=true system.epochs=4 system.warmup_steps=50 logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_smoke_test logger.loggers.json.enabled=True" \
     "q_ortho_loss"
+
+touch /tmp/smoke_test_marker; sleep 1
 
 # Test 5: TD3 AdamO mode
 run_test "5/5 TD3 + AdamO" \
