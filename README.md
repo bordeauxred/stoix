@@ -274,8 +274,9 @@ We would like to thank the authors and developers of [Mava][mava] as this was es
 
 ## Running on Random Cluster
 
-1.) Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-2.) Get jax to detect gpu
+git clone git@github.com:bordeauxred/stoix.git
+cd stoix
+uv sync
 uv pip install "jax[cuda12_pip]==0.5.3" "jaxlib==0.5.3"
+uv run wandb login
