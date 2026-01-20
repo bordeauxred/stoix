@@ -107,12 +107,12 @@ for TASK_ID in $(seq $START_IDX $END_IDX); do
         echo ""
 
         if [ "$MODE" == "loss" ]; then
-            COEFF_ARG="system.ortho_lambda=0.2"
+            COEFF_ARG="+system.ortho_lambda=0.2"
         else
-            COEFF_ARG="system.ortho_coeff=0.001"
+            COEFF_ARG="+system.ortho_coeff=0.001"
         fi
 
-        uv run python stoix/systems/q_learning/ff_dqn.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,dqn,${TAG},depth_${DEPTH},${ENV_SHORT}]" +logger.loggers.file.enabled=True
+        uv run python stoix/systems/q_learning/ff_dqn.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,dqn,${TAG},depth_${DEPTH},${ENV_SHORT}]" logger.loggers.json.enabled=True
 
     else
         # TD3
@@ -132,7 +132,7 @@ for TASK_ID in $(seq $START_IDX $END_IDX); do
             COEFF_ARG="+system.ortho_coeff=0.001"
         fi
 
-        uv run python stoix/systems/ddpg/ff_td3.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true +system.log_spectral_freq=1000000 system.epochs=32 system.warmup_steps=200 system.actor_lr=3e-4 system.q_lr=3e-4 system.decay_learning_rates=false logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,td3,${TAG},depth_${DEPTH},${ENV_SHORT}]" +logger.loggers.file.enabled=True
+        uv run python stoix/systems/ddpg/ff_td3.py env=$ENV arch.seed=42 arch.total_timesteps=$STEPS arch.total_num_envs=$NUM_ENVS arch.num_evaluation=$NUM_EVAL "+multiseed=$SEEDS" "network.actor_network.pre_torso.layer_sizes=$LAYERS" network.actor_network.pre_torso.activation=groupsort "network.q_network.pre_torso.layer_sizes=$LAYERS" network.q_network.pre_torso.activation=groupsort +system.ortho_mode=$MODE $COEFF_ARG +system.ortho_exclude_output=true system.epochs=32 system.warmup_steps=200 system.actor_lr=3e-4 system.q_lr=3e-4 system.decay_learning_rates=false logger.loggers.wandb.enabled=True logger.loggers.wandb.project=stoix_depth_study_h100 "logger.loggers.wandb.tag=[depth_study,td3,${TAG},depth_${DEPTH},${ENV_SHORT}]" logger.loggers.json.enabled=True
     fi
 
     echo ""

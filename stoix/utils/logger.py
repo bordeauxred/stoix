@@ -757,7 +757,17 @@ def log_multiseed_wandb(
 
         num_updates = len(q_loss) if len(q_loss) > 0 else len(returns)
 
-        for step_idx in range(num_updates):
+        # TD3 ortho metrics (separate for actor and critic)
+        q_ortho_loss = np.asarray(seed_metrics.get("q_ortho_loss", []))
+        q_gram_deviation = np.asarray(seed_metrics.get("q_gram_deviation", []))
+        actor_ortho_loss = np.asarray(seed_metrics.get("actor_ortho_loss", []))
+        actor_gram_deviation = np.asarray(seed_metrics.get("actor_gram_deviation", []))
+
+        # Subsample to ~100 log points to avoid overwhelming WandB
+        max_log_points = 100
+        log_interval = max(1, num_updates // max_log_points)
+
+        for step_idx in range(0, num_updates, log_interval):
             log_dict = {}
 
             # Episode return: only count terminal steps
@@ -776,13 +786,25 @@ def log_multiseed_wandb(
             if len(actor_loss) > step_idx:
                 log_dict["actor_loss"] = float(actor_loss[step_idx])
 
-            # Ortho/isometric network metrics
+            # DQN ortho metrics
             if len(ortho_loss) > step_idx:
                 log_dict["ortho_loss"] = float(ortho_loss[step_idx])
             if len(total_loss) > step_idx:
                 log_dict["total_loss"] = float(total_loss[step_idx])
             if len(gram_deviation) > step_idx:
                 log_dict["gram_deviation"] = float(gram_deviation[step_idx])
+
+            # TD3 ortho metrics (separate for actor and critic)
+            if len(q_ortho_loss) > step_idx:
+                log_dict["q_ortho_loss"] = float(q_ortho_loss[step_idx])
+            if len(q_gram_deviation) > step_idx:
+                log_dict["q_gram_deviation"] = float(q_gram_deviation[step_idx])
+            if len(actor_ortho_loss) > step_idx:
+                log_dict["actor_ortho_loss"] = float(actor_ortho_loss[step_idx])
+            if len(actor_gram_deviation) > step_idx:
+                log_dict["actor_gram_deviation"] = float(actor_gram_deviation[step_idx])
+
+            # Other metrics
             if len(grad_norm) > step_idx:
                 log_dict["grad_norm"] = float(grad_norm[step_idx])
             if len(explained_variance) > step_idx:
