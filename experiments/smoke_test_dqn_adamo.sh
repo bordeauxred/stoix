@@ -21,7 +21,7 @@ echo -e "${YELLOW}DQN AdamO Smoke Test${NC}"
 echo -e "${YELLOW}============================================================${NC}"
 
 # Configuration
-SYSTEM="stoix/systems/q_learning/ff_dqn_ortho.py"
+SYSTEM="stoix/systems/q_learning/ff_dqn.py"
 ENV="gymnax/breakout"
 SEEDS="[42,43,44]"  # 3 seeds for quick test
 NUM_ENVS=32
