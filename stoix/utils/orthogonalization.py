@@ -587,8 +587,8 @@ def apply_ortho_update(
     lr: float,
     ortho_coeff: float,
     exclude_output: bool = True,
-) -> FrozenDict:
-    """Apply decoupled orthonormalization update.
+) -> Tuple[FrozenDict, Dict]:
+    """Apply decoupled orthonormalization update with metrics.
 
     Stateless - computes param eligibility on-the-fly during tracing.
     No stored state means no pmap/replicate issues.
@@ -604,13 +604,16 @@ def apply_ortho_update(
         exclude_output: Skip output layer (detected by heuristic)
 
     Returns:
-        Updated params with ortho regularization applied to eligible kernels.
+        Tuple of:
+        - Updated params with ortho regularization applied to eligible kernels
+        - Dict with metrics: {"gram_deviation": mean deviation, "num_ortho_layers": count}
 
     Example:
         # In training loop, after Adam update:
         new_params = optax.apply_updates(params, updates)
         if ortho_mode == "optimizer":
-            new_params = apply_ortho_update(new_params, lr, ortho_coeff)
+            new_params, ortho_info = apply_ortho_update(new_params, lr, ortho_coeff)
+            # ortho_info["gram_deviation"] available for logging
     """
     # Find output layer once (happens during tracing, not execution)
     output_layer_path = None
@@ -618,6 +621,9 @@ def apply_ortho_update(
         kernels = get_dense_kernels(params)
         if kernels:
             output_layer_path = _find_output_layer_path(list(kernels.keys()))
+
+    # Collect gram deviations during update (list populated at trace time)
+    gram_deviations = []
 
     def update_param(path, param):
         # Convert path tuple to string for matching
@@ -641,13 +647,34 @@ def apply_ortho_update(
             # Wide: WW^T should be (n_out/n_in) * I
             gram = param @ param.T
             scale = n_out / n_in
+            target = scale * jnp.eye(n_in)
             ortho_grad = 2.0 * (gram @ param - scale * param)
         else:
             # Tall/Square: W^TW should be I
             gram = param.T @ param
+            target = jnp.eye(n_out)
             ortho_grad = 2.0 * (param @ gram - param)
+
+        # Compute gram deviation (Frobenius norm of gram - target)
+        deviation = jnp.sqrt(jnp.sum((gram - target) ** 2))
+        gram_deviations.append(deviation)
 
         # Decoupled update: params -= lr * coeff * grad
         return param - lr * ortho_coeff * ortho_grad
 
-    return jax.tree_util.tree_map_with_path(update_param, params)
+    new_params = jax.tree_util.tree_map_with_path(update_param, params)
+
+    # Aggregate metrics
+    if gram_deviations:
+        mean_deviation = jnp.mean(jnp.stack(gram_deviations))
+        num_layers = len(gram_deviations)
+    else:
+        mean_deviation = jnp.array(0.0)
+        num_layers = 0
+
+    ortho_info = {
+        "gram_deviation": mean_deviation,
+        "num_ortho_layers": num_layers,
+    }
+
+    return new_params, ortho_info

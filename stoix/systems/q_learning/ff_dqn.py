@@ -228,8 +228,9 @@ def get_learner_fn(
             q_new_online_params = optax.apply_updates(params.online, q_updates)
 
             # Apply decoupled ortho regularization if mode="optimizer"
+            ortho_info = {}
             if ortho_mode == "optimizer":
-                q_new_online_params = apply_ortho_update(
+                q_new_online_params, ortho_info = apply_ortho_update(
                     q_new_online_params, q_lr_value, ortho_coeff, ortho_exclude_output
                 )
 
@@ -246,6 +247,7 @@ def get_learner_fn(
             # PACK LOSS INFO
             loss_info = {
                 **q_loss_info,
+                **ortho_info,  # gram_deviation if ortho_mode="optimizer"
             }
             return (new_params, new_opt_state, buffer_state, key), loss_info
 
@@ -683,9 +685,10 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
 
                 # Apply decoupled ortho regularization if mode="optimizer"
                 if ortho_mode == "optimizer":
-                    new_online_params = apply_ortho_update(
+                    new_online_params, ortho_info = apply_ortho_update(
                         new_online_params, q_lr_value, ortho_coeff, ortho_exclude_output
                     )
+                    loss_info = {**loss_info, **ortho_info}
 
                 new_target_params = optax.incremental_update(
                     new_online_params, params.target, config.system.tau
@@ -710,9 +713,11 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[OnlineAndTa
                 "is_terminal": traj_batch.info["is_terminal_step"],
                 "q_loss": q_loss_mean,
             }
-            # Add ortho metrics if in loss mode
+            # Add ortho metrics
             if ortho_mode == "loss":
                 metrics["ortho_loss"] = jnp.mean(loss_infos["ortho_loss"])
+                metrics["gram_deviation"] = jnp.mean(loss_infos["gram_deviation"])
+            elif ortho_mode == "optimizer":
                 metrics["gram_deviation"] = jnp.mean(loss_infos["gram_deviation"])
 
             # Compute episode return (mean over terminal steps)

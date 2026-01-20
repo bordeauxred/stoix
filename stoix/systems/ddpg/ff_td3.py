@@ -322,8 +322,9 @@ def get_learner_fn(
             actor_new_online_params = optax.apply_updates(params.actor_params.online, actor_updates)
 
             # Apply decoupled ortho to actor if mode="optimizer"
+            actor_ortho_info = {}
             if ortho_mode == "optimizer":
-                actor_new_online_params = apply_ortho_update(
+                actor_new_online_params, actor_ortho_info = apply_ortho_update(
                     actor_new_online_params, actor_lr_value, ortho_coeff, ortho_exclude_output
                 )
 
@@ -332,8 +333,9 @@ def get_learner_fn(
             q_new_online_params = optax.apply_updates(params.q_params.online, q_updates)
 
             # Apply decoupled ortho to critic if mode="optimizer"
+            q_ortho_info = {}
             if ortho_mode == "optimizer":
-                q_new_online_params = apply_ortho_update(
+                q_new_online_params, q_ortho_info = apply_ortho_update(
                     q_new_online_params, q_lr_value, ortho_coeff, ortho_exclude_output
                 )
 
@@ -356,6 +358,11 @@ def get_learner_fn(
                 **actor_loss_info,
                 **q_loss_info,
             }
+            # Add ortho metrics for optimizer mode (prefixed by network type)
+            if actor_ortho_info:
+                loss_info["actor_gram_deviation"] = actor_ortho_info["gram_deviation"]
+            if q_ortho_info:
+                loss_info["q_gram_deviation"] = q_ortho_info["gram_deviation"]
             return (new_params, new_opt_state, buffer_state, key), loss_info
 
         update_state = (params, opt_states, buffer_state, key)
@@ -875,8 +882,9 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                 new_q_online = optax.apply_updates(params.q_params.online, q_updates)
 
                 # Apply decoupled ortho to critic if mode="optimizer"
+                q_ortho_info = {}
                 if ortho_mode == "optimizer":
-                    new_q_online = apply_ortho_update(
+                    new_q_online, q_ortho_info = apply_ortho_update(
                         new_q_online, q_lr_value, ortho_coeff, ortho_exclude_output
                     )
 
@@ -885,8 +893,9 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                 new_actor_online = optax.apply_updates(params.actor_params.online, actor_updates)
 
                 # Apply decoupled ortho to actor if mode="optimizer"
+                actor_ortho_info = {}
                 if ortho_mode == "optimizer":
-                    new_actor_online = apply_ortho_update(
+                    new_actor_online, actor_ortho_info = apply_ortho_update(
                         new_actor_online, actor_lr_value, ortho_coeff, ortho_exclude_output
                     )
 
@@ -904,6 +913,11 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                 new_opt_states = DDPGOptStates(new_actor_opt_state, new_q_opt_state)
 
                 loss_info = {**actor_loss_info, **q_loss_info}
+                # Add ortho metrics for optimizer mode (prefixed by network type)
+                if actor_ortho_info:
+                    loss_info["actor_gram_deviation"] = actor_ortho_info["gram_deviation"]
+                if q_ortho_info:
+                    loss_info["q_gram_deviation"] = q_ortho_info["gram_deviation"]
                 return (new_params, new_opt_states, key), loss_info
 
             key, epoch_key = jax.random.split(key)
@@ -924,11 +938,14 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
                 "q_loss": q_loss_mean,
                 "actor_loss": actor_loss_mean,
             }
-            # Add ortho metrics if in loss mode
+            # Add ortho metrics based on mode
             if ortho_mode == "loss":
                 metrics["q_ortho_loss"] = jnp.mean(loss_infos["q_ortho_loss"])
                 metrics["q_gram_deviation"] = jnp.mean(loss_infos["q_gram_deviation"])
                 metrics["actor_ortho_loss"] = jnp.mean(loss_infos["actor_ortho_loss"])
+                metrics["actor_gram_deviation"] = jnp.mean(loss_infos["actor_gram_deviation"])
+            elif ortho_mode == "optimizer":
+                metrics["q_gram_deviation"] = jnp.mean(loss_infos["q_gram_deviation"])
                 metrics["actor_gram_deviation"] = jnp.mean(loss_infos["actor_gram_deviation"])
 
             # Compute episode return (mean over terminal steps)
