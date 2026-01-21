@@ -704,8 +704,23 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
         # Add collected trajectory to buffer
         buffer_state = buffer_fn.add(buffer_state, traj_batch)
 
+        # Progress logging: every 100k steps
+        num_updates = config.arch.num_updates
+        steps_per_update = config.system.rollout_length * config.arch.num_envs
+        total_steps = num_updates * steps_per_update
+        log_every_steps = 100_000  # Log every 100k environment steps
+        log_interval = max(1, log_every_steps // steps_per_update)
+
+        def _progress_callback(step, q_loss, actor_loss, episode_return, num_updates, steps_per_update):
+            """Print progress during training."""
+            current_steps = (step + 1) * steps_per_update
+            total = num_updates * steps_per_update
+            pct = 100.0 * current_steps / total
+            ret_str = f"return: {episode_return:.1f}" if episode_return is not None else "return: --"
+            print(f"\r[Step {current_steps:,}/{total:,}] {ret_str} | q: {q_loss:.4f} actor: {actor_loss:.4f} | {pct:.1f}%", end="", flush=True)
+
         # Training step: collect rollout, add to buffer, then do gradient updates
-        def _train_step(carry, _):
+        def _train_step(carry, step_idx):
             params, opt_states, buffer_state, env_state, timestep, key = carry
 
             # Collect rollout_length transitions
@@ -819,22 +834,50 @@ def make_train(config: DictConfig) -> Callable[[chex.PRNGKey], Tuple[DDPGParams,
             )
 
             # Collect metrics from trajectory batch
+            q_loss_mean = jnp.mean(loss_infos["q_loss"])
+            actor_loss_mean = jnp.mean(loss_infos["actor_loss"])
             metrics = {
                 "episode_return": traj_batch.info["episode_return"],
                 "episode_length": traj_batch.info["episode_length"],
                 "is_terminal": traj_batch.info["is_terminal_step"],
-                "q_loss": jnp.mean(loss_infos["q_loss"]),
-                "actor_loss": jnp.mean(loss_infos["actor_loss"]),
+                "q_loss": q_loss_mean,
+                "actor_loss": actor_loss_mean,
             }
+
+            # Compute episode return (mean over terminal steps)
+            is_terminal = traj_batch.info["is_terminal_step"]
+            episode_returns = traj_batch.info["episode_return"]
+            mean_return = jnp.where(
+                jnp.any(is_terminal),
+                jnp.sum(jnp.where(is_terminal, episode_returns, 0.0)) / jnp.maximum(jnp.sum(is_terminal), 1),
+                jnp.nan,
+            )
+
+            # Progress logging (only at intervals to avoid slowdown)
+            def _log_progress(step, q_loss, actor_loss, ep_return):
+                import math
+                # step/losses may be batched when vmapped over seeds
+                step_val = int(step.flatten()[0]) if hasattr(step, 'flatten') else int(step)
+                q_loss_val = float(q_loss.mean()) if hasattr(q_loss, 'mean') else float(q_loss)
+                actor_loss_val = float(actor_loss.mean()) if hasattr(actor_loss, 'mean') else float(actor_loss)
+                ep_return_val = float(ep_return.mean()) if hasattr(ep_return, 'mean') else float(ep_return)
+                ep_return_val = None if math.isnan(ep_return_val) else ep_return_val
+                if step_val % log_interval == 0:
+                    _progress_callback(step_val, q_loss_val, actor_loss_val, ep_return_val, num_updates, steps_per_update)
+
+            jax.debug.callback(_log_progress, step_idx, q_loss_mean, actor_loss_mean, mean_return)
 
             return (new_params, new_opt_states, new_buffer_state, new_env_state, new_timestep, key), metrics
 
         # Run training
-        num_updates = config.arch.num_updates
         init_carry = (params, opt_states, buffer_state, env_states, timesteps, train_rng)
+        step_indices = jnp.arange(num_updates)
         (final_params, _, _, _, _, _), all_metrics = jax.lax.scan(
-            _train_step, init_carry, None, num_updates
+            _train_step, init_carry, step_indices
         )
+
+        # Print newline after progress bar
+        jax.debug.callback(lambda: print())
 
         return final_params, all_metrics
 
